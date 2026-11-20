@@ -18,8 +18,14 @@ services:
       - RECONCILER_ID=primary-001
       - CONTRACT_ID=${CONTRACT_ID:-}
       - STREAM_IDS=${STREAM_IDS:-}
+      - AUDIT_DIR=${AUDIT_DIR:-/var/lib/streampay-audit}
+      - AUDIT_INTERVAL_MS=${AUDIT_INTERVAL_MS:-60000}
+      - AUDIT_ARTIFACT_LIMIT=${AUDIT_ARTIFACT_LIMIT:-2000}
+      - AUDIT_TOLERANCE_EPSILON=${AUDIT_TOLERANCE_EPSILON:-1}
+      - AUDIT_FLAP_WINDOW_MS=${AUDIT_FLAP_WINDOW_MS:-120000}
     volumes:
       - reconciler-logs:/app/logs
+      - reconciler-audit:/var/lib/streampay-audit
     depends_on:
       - indexer
     ports:
@@ -56,6 +62,7 @@ services:
       - "streampay.component=webhook-target"
 
 volumes:
+  reconciler-audit:
   reconciler-logs:
   indexer-data:
 

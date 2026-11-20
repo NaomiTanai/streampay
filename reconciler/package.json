@@ -1,18 +1,26 @@
 {
   "name": "streampay-reconciler",
   "version": "1.0.0",
-  "description": "Dual-read reconciliation service comparing Horizon (classic-bridge effects) vs Soroban RPC contract state",
+  "description": "Dual-read reconciliation service comparing Horizon (classic-bridge effects) vs Soroban RPC contract state, with a continuous merkleized state audit",
   "type": "module",
   "engines": {
     "node": ">=20"
   },
+  "main": "dist/index.js",
+  "bin": {
+    "streampay-reconciler-verify": "dist/audit/verifier.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "start": "node dist/src/index.js",
+    "start": "node dist/index.js",
+    "audit": "node dist/index.js audit --once",
+    "verify": "node dist/audit/verifier.js",
+    "verify:published": "node dist/audit/verifier.js --bundle testdata/audit-bundle.json --report testdata/audit-report.json --artifact testdata/audit-artifact.json",
+    "testdata": "node dist/tools/publish-testdata.js",
     "dev": "node --import=tsx src/index.ts",
-    "test": "node --test tests/**/*.test.js",
-    "soak": "node tests/soak-test.js"
+    "test": "npm run build && node --test dist/audit/canonical.test.js dist/audit/merkle.test.js dist/audit/tolerance.test.js dist/audit/auditor.test.js dist/audit/dedup.test.js dist/audit/continuous.test.js dist/audit/verifier.test.js dist/engine/diff.test.js dist/index.test.js",
+    "soak": "npm run build && node dist/tools/soak.js"
   },
   "dependencies": {
     "axios": "^1.7.0"

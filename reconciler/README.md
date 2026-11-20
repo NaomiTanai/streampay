@@ -34,10 +34,15 @@ Integrates with the **Issue #2 indexer dashboard withdrawal panel** via webhook 
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
-| Horizon Reader | `src/readers/horizon.js` | Polls Horizon API for classic-bridge effects related to StreamPay streams |
-| Soroban RPC Reader | `src/readers/soroban.js` | Queries Soroban RPC `getContractData` for current contract storage state |
-| Reconciliation Engine | `src/engine/diff.js` | Compares both sources, applies consistency lag window, detects divergences |
-| Alerting Service | `src/alerting.js` | Structured JSON logging + webhook dispatch to indexer dashboard |
+| Horizon Reader | `src/readers/horizon.ts` | Polls Horizon API for classic-bridge effects related to StreamPay streams |
+| Soroban RPC Reader | `src/readers/soroban.ts` | Queries Soroban RPC `getContractData` for current contract storage state |
+| Reconciliation Engine | `src/engine/diff.ts` | Compares both sources, applies consistency lag window, detects divergences |
+| Alerting Service | `src/alerting.ts` | Structured JSON logging + webhook dispatch to indexer dashboard |
+| Canonical records | `src/audit/canonical.ts` | The one `StreamEntry`-shaped encoding both sides are merkleized through |
+| Merkle tree | `src/audit/merkle.ts` | Sorted tree with inclusion and exclusion proofs, odd nodes promoted |
+| State auditor | `src/audit/auditor.ts` | Merkleizes both reads, classifies each difference, emits witnesses |
+| Publication | `src/audit/publication.ts` | Checkpointed, rate-bounded continuous loop writing roots + proofs |
+| Public verifier | `src/audit/verifier.ts` | Recomputes everything from published artifacts alone |
 
 ---
 
@@ -59,6 +64,56 @@ Create a `.env` file in `reconciler/` (copy from `.env.example`):
 | `RECONCILER_ID` | No | `primary-001` | Unique instance identifier for multi-instance deployments |
 | `CONTRACT_ID` | No | — | StreamPay Soroban contract ID |
 | `STREAM_IDS` | No | — | Comma-separated stream IDs to monitor |
+| `AUDIT_DIR` | No | `audit-out` | Where report/bundle/artifact/checkpoint files are written |
+| `AUDIT_INTERVAL_MS` | No | `60000` | Minimum spacing between audit cycles |
+| `AUDIT_ARTIFACT_LIMIT` | No | `2000` | Publish the full record set as an artifact when each side has at most this many records (`0` disables it) |
+| `AUDIT_TOLERANCE_EPSILON` | No | `1` | Amount tolerance grid; `1` tolerates nothing, `10` treats sub-10-unit accrual as rounding |
+| `AUDIT_FLAP_WINDOW_MS` | No | `120000` | How long a key must hold one state before a transition pages anyone |
+
+---
+
+## Continuous merkleized state audit
+
+Every cycle the auditor merkleizes **both** sides of the read — the contract
+state and its own projection — and publishes the four roots together with the
+ledger sequence they describe. A root difference is then explained, not
+asserted: each divergent record gets a witness carrying its canonical tuple
+plus an inclusion proof on the side that has it and an exclusion proof on the
+side that does not.
+
+| Verdict | Meaning |
+|---------|---------|
+| `clean` | Both raw roots are identical |
+| `rounding_only` | Amounts differ but every difference lands on the same `AUDIT_TOLERANCE_EPSILON` grid point |
+| `fault` | A value differs beyond tolerance, or a record exists on one side only |
+
+Cycles are checkpointed (`AUDIT_DIR/<reconciler-id>-checkpoint.json`), so a
+restart resumes the incident table instead of re-paging, and rate-bounded by
+`AUDIT_INTERVAL_MS`. Alerts are de-duplicated: a persisting divergence is one
+incident, and a key that flickers inside `AUDIT_FLAP_WINDOW_MS` does not page.
+
+```bash
+npm run audit            # one cycle, writes report + bundle + artifact
+node dist/index.js audit # continuous audit loop
+```
+
+### Verifying a publication without trusting the auditor
+
+The verifier reads only published files — no readers, no credentials:
+
+```bash
+node dist/audit/verifier.js --bundle  audit-out/primary-001-bundle.json
+node dist/audit/verifier.js --report  audit-out/primary-001-report.json \
+                              --artifact audit-out/primary-001-artifact.json
+```
+
+It re-derives every leaf hash from the witness tuples, folds every Merkle path
+against the published roots, re-runs the tolerance classification from the
+bundle's own policy digest, and recomputes the verdict. Exit code 0 means the
+whole artifact reproduced; 1 means something published does not recompute.
+`testdata/` holds a committed divergent publication that CI re-verifies on
+every pull request; regenerate it with `npm run testdata` only when the
+canonical encoding, the tree shape or the verdict rules change on purpose.
 
 ---
 
@@ -179,22 +234,35 @@ docker compose down
 
 ## Testing
 
-### Unit Tests (`tests/diff.test.js`)
+### Audit Tests (`src/audit/*.test.ts`)
 
-Covers four scenarios:
+The suite runs on the compiled output (`npm test` builds first) and covers:
 
-1. **Perfectly in-sync states** — both sources agree, no alerts
-2. **Out-of-sync within consistency lag window** — treated as expected lag, no divergence
-3. **True state divergence outside lag window** — triggers ERROR + webhook
-4. **Missing or malformed data edge cases** — stream missing from either source, missing deposit fields, status-only mismatches
+| File | What it pins down |
+|------|-------------------|
+| `audit/canonical.test.ts` | the field set/order mirrors `StreamEntry`, tamper-sensitive bytes |
+| `audit/merkle.test.ts` | inclusion + exclusion proofs, promoted odd nodes, forged-path rejection |
+| `audit/tolerance.test.ts` | rounding grid vs a real divergence, non-amount fields never tolerated |
+| `audit/auditor.test.ts` | divergence injection pinpoints the exact record and its proofs verify |
+| `audit/dedup.test.ts` | one incident per divergence, flap suppression, restart resume |
+| `audit/continuous.test.ts` | checkpointing, rate bounding, ledger-advance skip, failure budget |
+| `audit/verifier.test.ts` | a publication recomputes from files alone; tampering is caught |
+| `engine/diff.test.ts` | dual-read lag/divergence classification and the alert gate |
+
+Regenerate the committed publication with `npm run testdata` when a canonical
+rule changes deliberately — CI then requires `npm run verify:published` to
+still reproduce it.
 
 ```bash
 npm test
+npm run verify:published
 ```
 
-### Soak Test (`tests/soak-test.js`)
+### Soak Harness (`src/tools/soak.ts`)
 
-Deliberately injects stale Soroban RPC responses to trigger real divergence alarms. Tests various delay scenarios and prints a PR-ready report.
+Deliberately injects stale Soroban RPC and Horizon responses to trigger real
+divergence alarms, then runs one merkleized audit cycle and prints a PR-ready
+report.
 
 ```bash
 npm run soak
