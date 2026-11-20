@@ -34,6 +34,17 @@ The service indexes the contract's emitted event topics: `stream_created`, `with
 | `OUTBOX_BATCH_SIZE` | `200` | Max intent claims per consumer per tick (cap 1000) |
 | `OUTBOX_CLAIM_TIMEOUT_MS` | `60000` | Stale-claim reclaim threshold (crash recovery) |
 | `OUTBOX_MAX_DEPTH` | off | Global backpressure threshold for pending+in-flight intents |
+| `WEBHOOK_SECRET_ENCRYPTION_KEY` | off | 64-hex (or passphrase) AES-256-GCM key that seals signing secrets at rest |
+| `WEBHOOK_REQUIRE_ENCRYPTION` | off | `1` refuses plaintext secret storage; creations answer `503` without a key |
+| `WEBHOOK_TENANT_KEYS` | off | `tenantId:keyId:secret` triples, comma-separated (only digests are kept) |
+| `WEBHOOK_DEFAULT_TENANT_ID` | `default` | Tenant used when no directory is configured |
+| `WEBHOOK_TENANT_QUOTA_SUBSCRIPTIONS` | `20` | Subscriptions a tenant may hold |
+| `WEBHOOK_TENANT_QUOTA_EVENTS` | `24` | Event names one subscription may select |
+| `WEBHOOK_TENANT_QUOTA_ROTATIONS` | `6` | Secret rotations per rolling hour, per subscription |
+| `WEBHOOK_SECRET_ROTATION_OVERLAP_MS` | `86400000` | How long a rotated-out secret keeps verifying |
+| `WEBHOOK_SLA_MS` | `5000` | Per-attempt delivery commitment |
+| `WEBHOOK_SLA_BREACH_BUDGET` | `0.01` | Fraction of the window allowed to miss the SLA |
+| `WEBHOOK_SLA_MIN_SAMPLES` | `20` | Window depth required before the breach alarm engages |
 | `SHUTDOWN_DRAIN_MS` | `10000` | On SIGTERM/SIGINT, how long in-flight ingest and outbox dispatch may finish before the process exits (exit code `0` if drained, `1` if the window expired). Keep it below your orchestrator's kill grace period |
 | `WASM_PLUGIN_TIMEOUT_MS` | `500` | Per-invocation wall-clock budget for a WASM plugin transform, in milliseconds (max 5000). A plugin that exceeds it is killed and the subscription falls back to the raw stream |
 | `WASM_REDACTION_ENABLED` | unset (off) | Set to `1` to truncate full Stellar addresses in delivered event data to the 8-character prefix. Redaction runs after plugin transforms, never before |
@@ -340,6 +351,35 @@ guarantees: [docs/OUTBOX.md](../docs/OUTBOX.md).
 - `POST /api/outbox/retract` — reorg retraction hook (reconciler)
 - `GET /api/outbox/stats` — depth by state and replay high-water
 - `GET /metrics` — Prometheus exposition (`streampay_outbox_*`)
+
+---
+
+### Webhook Subscriptions (shared, tenant-isolated)
+
+One indexer serves many integrators. Subscriptions are managed through the
+registry in `src/webhooks/`, which adds an identity, a quota and a measured
+delivery commitment to the existing dispatcher, HMAC, SSRF guard, retry
+schedule and DLQ. Full contract:
+[docs/WEBHOOKS.md §7](../docs/WEBHOOKS.md).
+
+- `GET/POST /api/webhooks/endpoints` — list the caller's subscriptions; create
+  one. The `201` body is the only place the signing secret is ever disclosed.
+- `GET/PATCH/DELETE /api/webhooks/endpoints/:id` — read, retarget, disable or
+  remove. Reads carry `secret_fingerprint`, never the secret.
+- `POST /api/webhooks/endpoints/:id/rotate-secret` — new secret, outgoing key
+  keeps verifying for the overlap window (dual signatures).
+- `GET /api/webhooks/endpoints/:id/rotations` — rotation history by fingerprint.
+- `GET /api/webhooks/quota` · `GET /api/webhooks/sla` — the caller's budget and
+  measured delivery SLA.
+- `GET /api/webhooks/deliveries` · `GET /api/webhooks/dlq` ·
+  `POST /api/webhooks/dlq/:id/retry` — scoped to the caller's subscriptions.
+- `POST /api/webhooks/rotations/expire` — retire elapsed overlap windows.
+
+Credentials go in `x-streampay-webhook-key` (or `Authorization: Bearer …`).
+Another tenant's id answers `404`, never `403`, so the API cannot be used to
+enumerate who else subscribes. With no `WEBHOOK_TENANT_KEYS` configured the
+routes keep their historical single-tenant behaviour and the registry-only
+routes answer `503`.
 
 ---
 
