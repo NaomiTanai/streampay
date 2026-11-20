@@ -39,6 +39,13 @@ always present, so a consumer can branch on it without guessing.
 - `stream_cancelled`: Stream closed with pro-rata split between recipient and sender.
 - `stream_paused` / `stream_resumed`: Stream state toggled.
 - `stream_ping`: Test fire ping emitted from dashboard.
+- `anomaly_alert`: Heuristic fraud detection raised or resolved for *your*
+  tenant ([#582](https://github.com/Neziahtech/streampay/issues/582),
+  [docs/ANOMALY.md](ANOMALY.md)). Reserved name with no schema entry, because
+  the indexer originates it rather than the contract; its `data` is the redacted
+  alert view (8-character address prefixes, no amounts) and it is queued only to
+  the tenant the detection belongs to — a `*` subscription belonging to someone
+  else never hears about it.
 
 ---
 

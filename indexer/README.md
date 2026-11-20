@@ -45,6 +45,15 @@ The service indexes the contract's emitted event topics: `stream_created`, `with
 | `WEBHOOK_SLA_MS` | `5000` | Per-attempt delivery commitment |
 | `WEBHOOK_SLA_BREACH_BUDGET` | `0.01` | Fraction of the window allowed to miss the SLA |
 | `WEBHOOK_SLA_MIN_SAMPLES` | `20` | Window depth required before the breach alarm engages |
+| `ANOMALY_RULES_JSON` | off | Deployment-wide rule config, `{ "<rule_id>": { mode, severity, params, ... } }`; malformed or unknown knobs fail the boot |
+| `ANOMALY_MODE` | `shadow` | Mode for rules nobody has named. `shadow` records detections and pages nobody |
+| `ANOMALY_FLAP_WINDOW_MS` | `120000` | How long an incident must hold one state before the transition is reported |
+| `ANOMALY_RENOTIFY_AFTER_MS` | `0` | Re-raise a still-open incident after this long; `0` disables heartbeats |
+| `ANOMALY_HYDRATE_LEDGERS` | `2880` | Ledgers rebuilt into the sliding windows at boot; `0` skips hydration |
+| `ANOMALY_HYDRATE_MAX_EVENTS` | `50000` | Rows one boot may read while hydrating; a truncated range is logged |
+| `ANOMALY_SUPPRESSION_TTL_MS` | `86400000` | How long a `false_positive` review suppresses its subject (clamped to 30 days) |
+| `ANOMALY_REPLAY_MAX_EVENTS` | `50000` | Rows one replay may read, so a citation cannot become a DoS |
+| `ANOMALY_WEBHOOK_ALERTS` | on | `0` keeps anomaly alerts in the log instead of fanning out `anomaly_alert` deliveries |
 | `SHUTDOWN_DRAIN_MS` | `10000` | On SIGTERM/SIGINT, how long in-flight ingest and outbox dispatch may finish before the process exits (exit code `0` if drained, `1` if the window expired). Keep it below your orchestrator's kill grace period |
 | `WASM_PLUGIN_TIMEOUT_MS` | `500` | Per-invocation wall-clock budget for a WASM plugin transform, in milliseconds (max 5000). A plugin that exceeds it is killed and the subscription falls back to the raw stream |
 | `WASM_REDACTION_ENABLED` | unset (off) | Set to `1` to truncate full Stellar addresses in delivered event data to the 8-character prefix. Redaction runs after plugin transforms, never before |
@@ -380,6 +389,43 @@ Another tenant's id answers `404`, never `403`, so the API cannot be used to
 enumerate who else subscribes. With no `WEBHOOK_TENANT_KEYS` configured the
 routes keep their historical single-tenant behaviour and the registry-only
 routes answer `503`.
+
+---
+
+### Anomaly Detection (rules, detections, replay)
+
+The indexer evaluates heuristic fraud patterns over the events it ingests and
+records each hit as a detection that cites the ledger range it came from. Rules
+are per-tenant configuration, detections are evidence, and a rule only pages
+once an operator has reviewed enough of its shadow detections. Full design:
+[docs/ANOMALY.md](../docs/ANOMALY.md).
+
+- `GET /api/anomaly/rules` — the catalog as this tenant runs it: mode, severity,
+  version, and each knob's default, range and description.
+- `POST/DELETE /api/anomaly/rules/:ruleId/override` — tune or un-tune one rule.
+  An unknown rule is `404 unknown_rule`; an unknown param, an out-of-range
+  number or a bad mode is `400` with the accepted set. Nothing silently falls
+  back to a default.
+- `GET /api/anomaly/detections` · `GET /api/anomaly/detections/:id` — this
+  tenant's detections, redacted (8-character address prefixes, no amounts), the
+  second with its review history.
+- `POST /api/anomaly/detections/:id/replay` — re-derive the claim from its cited
+  ledger range using the thresholds recorded on the detection. Answers
+  `verified` or why not (`citation_incomplete`, `range_too_large`,
+  `rule_version_unavailable`, `not_reproduced`, …).
+- `POST /api/anomaly/detections/:id/feedback` — `true_positive` or
+  `false_positive`; a false positive also suppresses that subject for
+  `ANOMALY_SUPPRESSION_TTL_MS`. A contradictory second review is `409`, because
+  the false-positive budget must not depend on who looked last.
+- `GET /api/anomaly/promotion` · `POST /api/anomaly/rules/:ruleId/promote` —
+  shadow → `enforce`, licensed only by the review evidence; `409` carries the
+  reasons.
+- `GET /api/anomaly/incidents` — open incidents, tracked subject counts, and
+  active suppressions.
+
+Authentication and tenant isolation are the webhook registry's: the same
+`x-streampay-webhook-key` credentials, and another tenant's detection id is
+`404`. The routes are absent entirely when the deployment runs no detector.
 
 ---
 

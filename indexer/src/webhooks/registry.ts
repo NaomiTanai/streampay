@@ -8,8 +8,13 @@ import { DEFAULT_ROTATION_OVERLAP_MS } from "./store.js";
 import { SecretCipher } from "./secrets.js";
 import type { WebhookMetrics, WebhookSlaSnapshot } from "./metrics.js";
 
-/** Everything a caller may select: the catalog, plus two reserved names. */
-export const RESERVED_EVENT_NAMES: readonly string[] = ["*", "stream_ping"];
+/**
+ * Everything a caller may select: the contract catalog, plus the reserved
+ * names this indexer originates itself. `anomaly_alert` (issue #582) is
+ * detector output and never comes from the contract, so it has no schema entry
+ * to validate against.
+ */
+export const RESERVED_EVENT_NAMES: readonly string[] = ["*", "stream_ping", "anomaly_alert"];
 
 export type SubscriptionErrorCode =
   | "invalid_url"
@@ -118,7 +123,7 @@ function normalizeEvents(events: string[] | undefined): string[] {
     if (!RESERVED_EVENT_NAMES.includes(name) && !isContractEventName(name)) {
       throw new SubscriptionError("invalid_events", `unknown event name '${name}'`, {
         event: name,
-        hint: "a contract event from the registry, '*' or 'stream_ping'",
+        hint: "a contract event from the registry, or one of " + RESERVED_EVENT_NAMES.map((name) => `'${name}'`).join(", "),
       });
     }
     seen.add(name);
