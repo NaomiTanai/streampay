@@ -10,6 +10,51 @@ interface: they are only ever appended to, never renumbered or reused.
 ## [Unreleased]
 
 ### Added
+- Reconciler continuous state audit with verifiable divergence proofs (#586):
+  the on-chain read and the indexer's own projection are merkleized with one
+  canonical record encoding, so both sides publish comparable roots for the same
+  ledger. A divergence is not an assertion any more — it is an
+  inclusion/exclusion proof naming the offending record, and rounding noise is
+  separated from real faults by re-deriving the verdict from the quantized roots
+  instead of trusting the auditor's own classification. `reconciler/verify.js`
+  recomputes every root and check from published artifacts alone, and a
+  deliberately divergent publication is committed under `reconciler/testdata` so
+  CI re-derives it on every PR (`npm run verify:published`). The reconciler is
+  now strict TypeScript (`npm run build && npm test` in `reconciler/`); the old
+  `.js` sources are gone.
+- Multi-tenant webhook subscription registry (#585): one shared indexer can now
+  serve many integrators without one of them being able to read, replay or
+  exhaust another's deliveries. Subscriptions are gated by a tenant key
+  (`x-streampay-webhook-key`) and scoped to a stable principal; another tenant's
+  endpoint id answers `404`, never `403`, so the API cannot enumerate subscribers.
+  Signing secrets are sealed with AES-256-GCM at rest, disclosed exactly once at
+  registration, and every read path carries only a fingerprint;
+  `POST /api/webhooks/endpoints/:id/rotate-secret` keeps the outgoing key
+  verifying for an overlap window. Per-tenant quotas bound the backlog anyone
+  tenant can create for the shared dispatcher, and delivery is measured per
+  tenant against `WEBHOOK_SLA_MS` with a minimum-sample guard, so one slow
+  subscriber is an account conversation rather than a fleet page. With no
+  `WEBHOOK_TENANT_KEYS` configured the routes keep their historical
+  single-tenant behaviour and the registry-only ones answer `503`.
+- Heuristic anomaly detection on stream patterns (#582): the indexer evaluates
+  a versioned rule catalog (`burst_creation`, `dust_spam`, `circular_flow`,
+  `create_cancel_churn`) over the events it ingests, in event time, and records
+  each hit as a detection that cites the ledger range it was derived from.
+  Detections are re-derivable: `POST /api/anomaly/detections/:id/replay`
+  re-computes the claim from its own citation under the thresholds recorded on
+  the detection and answers `verified` or a precise reason
+  (`citation_incomplete`, `range_too_large`, `rule_version_unavailable`,
+  `not_reproduced`), so an alert can be defended long after the window moved on.
+  Rules run in `shadow` until an operator's reviews clear a false-positive
+  budget — shadow detections are recorded and replayable but page nobody, and
+  promotion is refused with machine-readable reasons until the evidence exists.
+  Incidents dedup with a flap window and opt-in re-notification, alerts route
+  through log/webhook sinks with evidence redacted at the boundary (8-character
+  address prefixes, no amounts), and a false-positive review suppresses that
+  subject for a TTL rather than arguing with it forever. Rules, thresholds and
+  suppression are per tenant over the webhook registry's credentials. Design:
+  [`docs/ANOMALY.md`](docs/ANOMALY.md); triage: RUNBOOK §8; metrics, alert rules
+  and a Grafana row ship with it.
 - CLI shell completions (#518): `streampay completion <bash|zsh|fish>` prints a
   static completion script generated from the CLI's command registry
   (`tools/streampay-cli/src/registry.ts`), which the argument parser and

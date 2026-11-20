@@ -19,11 +19,32 @@ import { OutboxMetrics } from "./outbox/metrics.js";
 import { httpPushTransport } from "./outbox/http-transport.js";
 import { traceCorrelationRegistry } from "./telemetry.js";
 import { createGracefulShutdown, installShutdownHandlers } from "./shutdown.js";
+import { AnomalyEngine } from "./anomaly/engine.js";
+import type { AnomalyAlertSink } from "./anomaly/alerts.js";
+import { FanOutAlertSink, LogAlertSink, WebhookAlertSink, redactEvidence, redactSubject } from "./anomaly/alerts.js";
+import {
+  DEFAULT_SUPPRESSION_TTL_MS,
+  HYDRATE_LEDGERS_ENV,
+  REPLAY_MAX_EVENTS_ENV,
+  SUPPRESSION_TTL_ENV,
+  TenantRuleSource,
+  defaultModeFromEnv,
+  promotionReport,
+  ruleOverridesFromEnv,
+  type PromotionReport,
+} from "./anomaly/config.js";
+import { AnomalyMetrics } from "./anomaly/metrics.js";
+import type { AnomalyStore } from "./anomaly/store.js";
+import { parseIncidentKey } from "./anomaly/dedup.js";
+import { RULE_IDS, RuleConfigError, effectiveRule, type EffectiveRule } from "./anomaly/rules.js";
+import { DEFAULT_REPLAY_MAX_EVENTS, replayDetection } from "./anomaly/replay.js";
+import { toObservation } from "./anomaly/observations.js";
+import { FEEDBACK_LABELS, type Detection, type FeedbackLabel, type Observation, type RuleMode, type TenantRuleOverride } from "./anomaly/types.js";
 import type { DecodedEvent, Stream } from "./types.js";
 
 /** Express types a path parameter as `string | string[]`; routes take one id. */
-function routeId(req: express.Request): string {
-  return String(req.params.id ?? "");
+function routeId(req: express.Request, name = "id"): string {
+  return String(req.params[name] ?? "");
 }
 
 function parseCursor(raw: unknown): number {
@@ -102,6 +123,70 @@ export interface WebhookApiConfig {
   defaultTenantId?: string;
 }
 
+/**
+ * The heuristic anomaly detector's management surface (issue #582): which
+ * rules a tenant runs with, what they fired on, whether a detection replays,
+ * and whether a shadow rule has earned the right to page anyone.
+ */
+export interface AnomalyApiConfig {
+  engine: AnomalyEngine;
+  store: AnomalyStore;
+  rules: TenantRuleSource;
+  directory: TenantDirectory;
+  metrics: AnomalyMetrics;
+  /** Tenant used when the deployment provisions no keys, i.e. trusts its transport. */
+  defaultTenantId?: string;
+  /** How long a false-positive review suppresses its subject, absent a request override. */
+  suppressionTtlMs?: number;
+  /** Cap on the events one replay may read. */
+  replayMaxEvents?: number;
+}
+
+function ruleView(rule: EffectiveRule): Record<string, unknown> {
+  return {
+    id: rule.id,
+    version: rule.version,
+    summary: rule.summary,
+    scope: rule.scope,
+    severity: rule.config.severity,
+    mode: rule.config.mode,
+    false_positive_budget: rule.config.falsePositiveBudget,
+    min_reviews: rule.config.minReviews,
+    params: Object.entries(rule.config.params).map(([name, value]) => ({
+      name,
+      value,
+      default: rule.params[name]?.default,
+      min: rule.params[name]?.min,
+      max: rule.params[name]?.max,
+      description: rule.params[name]?.description,
+    })),
+  };
+}
+
+/** Redacted for the wire: identifiers keep their prefix, amounts never appear. */
+function detectionView(detection: Detection): Record<string, unknown> {
+  return {
+    id: detection.id,
+    rule_id: detection.ruleId,
+    rule_version: detection.ruleVersion,
+    severity: detection.severity,
+    mode: detection.mode,
+    subject: redactSubject(detection.subjectKey),
+    citation: {
+      from_ledger: detection.citation.fromLedger,
+      to_ledger: detection.citation.toLedger,
+      first_event_id: detection.citation.firstEventId,
+      last_event_id: detection.citation.lastEventId,
+      start_ms: detection.citation.startMs,
+      end_ms: detection.citation.endMs,
+    },
+    fingerprint: detection.fingerprint,
+    evidence: { ...redactEvidence(detection.evidence), cited_event_ids: detection.evidence.citedEventIds },
+    params: detection.params,
+    created_at_ms: detection.createdAtMs,
+  };
+}
+
 function bearerToken(header: string | string[] | undefined): string | undefined {
   const raw = Array.isArray(header) ? header[0] : header;
   if (!raw) return undefined;
@@ -109,8 +194,14 @@ function bearerToken(header: string | string[] | undefined): string | undefined 
   return match ? match[1] : undefined;
 }
 
+/** The part of an API config needed to identify a caller. */
+interface PrincipalConfig {
+  directory: TenantDirectory;
+  defaultTenantId?: string;
+}
+
 /**
- * Identify the caller of a webhook management request.
+ * Identify the caller of a management API request.
  *
  * With credentials provisioned, the tenant key is presented in
  * `x-streampay-webhook-key` (or a bearer token) and the tenant comes from the
@@ -118,7 +209,7 @@ function bearerToken(header: string | string[] | undefined): string | undefined 
  * unforgeable. With none provisioned the deployment is declaring itself
  * single-tenant, so every request is that one tenant.
  */
-function webhookPrincipal(config: WebhookApiConfig, req: express.Request): Principal | null {
+function webhookPrincipal(config: PrincipalConfig, req: express.Request): Principal | null {
   if (!config.directory.enforcesAuthentication) {
     return config.directory.principalFor(config.defaultTenantId ?? "default");
   }
@@ -135,7 +226,8 @@ export function createApp(
   rpcHealth?: () => EndpointHealth[],
   ingestStats?: () => IngestStats,
   proofConfig?: ProofConfig,
-  webhookApi?: WebhookApiConfig
+  webhookApi?: WebhookApiConfig,
+  anomalyApi?: AnomalyApiConfig
 ): express.Express {
   const app = express();
   app.use(express.json());
@@ -426,6 +518,7 @@ export function createApp(
     if (webhookApi?.metrics) {
       sections.push(webhookApi.metrics.render(store.webhooks.deliveryStats()).trimEnd());
     }
+    if (anomalyApi) sections.push(anomalyApi.metrics.render().trimEnd());
     if (sections.length === 0) sections.push("# no metrics configured");
     res.setHeader("Content-Type", "text/plain; version=0.0.4");
     return res.send(`${sections.join("\n")}\n`);
@@ -666,6 +759,242 @@ export function createApp(
     })
   );
 
+  // ── Anomaly detection API (issue #582) ─────────────────────────────────────
+  // Rules are configuration, detections are evidence, and a detection is only
+  // as good as the ledger range it cites: every read here is tenant-scoped and
+  // every identifier leaving here is redacted.
+  if (anomalyApi) {
+    const api = anomalyApi;
+
+    const anomalyRoute =
+      (handler: (tenantId: string, req: express.Request, res: express.Response) => unknown | Promise<unknown>) =>
+      async (req: express.Request, res: express.Response): Promise<void> => {
+        let tenantId = api.defaultTenantId ?? "default";
+        if (api.directory.enforcesAuthentication) {
+          const principal = webhookPrincipal(api, req);
+          if (principal === null) {
+            res.status(401).json({
+              error: "a tenant key is required in x-streampay-webhook-key",
+              code: "unauthenticated",
+            });
+            return;
+          }
+          tenantId = principal.tenantId;
+        }
+        try {
+          const result = await handler(tenantId, req, res);
+          if (result !== undefined && !res.headersSent) res.json(result);
+        } catch (err: unknown) {
+          if (err instanceof RuleConfigError) {
+            res.status(err.code === "unknown_rule" ? 404 : 400).json({ error: err.message, code: err.code, details: err.details });
+            return;
+          }
+          res.status(500).json({ error: sanitizeError(err), code: "internal_error" });
+        }
+      };
+
+    /** Owned by the caller tenant, or invisible: a foreign id must not confirm existence. */
+    const ownedDetection = (tenantId: string, id: string, res: express.Response): Detection | undefined => {
+      const detection = api.store.getDetection(id);
+      if (detection === undefined || detection.tenantId !== tenantId) {
+        res.status(404).json({ error: "detection not found", code: "not_found" });
+        return undefined;
+      }
+      return detection;
+    };
+
+    app.get(
+      "/api/anomaly/rules",
+      anomalyRoute((tenantId) => ({ tenant_id: tenantId, rules: api.rules.rulesFor(tenantId).map(ruleView) }))
+    );
+
+    app.post(
+      "/api/anomaly/rules/:ruleId/override",
+      anomalyRoute((tenantId, req) => {
+        const ruleId = routeId(req, "ruleId");
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const override: TenantRuleOverride = {};
+        if (typeof body["mode"] === "string") override.mode = body["mode"] as RuleMode;
+        if (typeof body["severity"] === "string") override.severity = body["severity"] as Detection["severity"];
+        if (body["params"] !== undefined && typeof body["params"] === "object") {
+          override.params = body["params"] as Record<string, number>;
+        }
+        if (typeof body["false_positive_budget"] === "number") override.false_positive_budget = body["false_positive_budget"];
+        if (typeof body["min_reviews"] === "number") override.min_reviews = body["min_reviews"];
+
+        // A POST replaces the tenant's override for that rule; an unknown rule
+        // or param is a validation error, never a silent default.
+        const rule = effectiveRule(ruleId, override);
+        api.store.setOverride(tenantId, ruleId, override, Date.now());
+        api.rules.invalidate(tenantId);
+        return { rule: ruleView(rule) };
+      })
+    );
+
+    app.delete(
+      "/api/anomaly/rules/:ruleId/override",
+      anomalyRoute((tenantId, req) => {
+        const ruleId = routeId(req, "ruleId");
+        if (!RULE_IDS.includes(ruleId)) {
+          throw new RuleConfigError("unknown_rule", `unknown rule '${ruleId}'`, { rule: ruleId, known: RULE_IDS });
+        }
+        api.store.setOverride(tenantId, ruleId, null, Date.now());
+        api.rules.invalidate(tenantId);
+        return { rule: ruleView(effectiveRule(ruleId)) };
+      })
+    );
+
+    app.get(
+      "/api/anomaly/detections",
+      anomalyRoute((tenantId, req) => {
+        const limit = parseLimit(req.query.limit, 50, 200);
+        const mode = typeof req.query.mode === "string" ? (req.query.mode as RuleMode) : undefined;
+        if (mode !== undefined && mode !== "shadow" && mode !== "enforce") {
+          return { error: "mode must be 'shadow' or 'enforce'", code: "invalid_mode" };
+        }
+        const ruleId = typeof req.query.rule === "string" ? req.query.rule : undefined;
+        return {
+          tenant_id: tenantId,
+          detections: api.store
+            .listDetections({ tenantId, ruleId, mode, limit })
+            .map(detectionView),
+        };
+      })
+    );
+
+    app.get(
+      "/api/anomaly/detections/:id",
+      anomalyRoute((tenantId, req, res) => {
+        const detection = ownedDetection(tenantId, routeId(req), res);
+        if (detection === undefined) return undefined;
+        return { detection: detectionView(detection), feedback: api.store.listFeedback(detection.id) };
+      })
+    );
+
+    app.post(
+      "/api/anomaly/detections/:id/replay",
+      anomalyRoute((tenantId, req, res) => {
+        const detection = ownedDetection(tenantId, routeId(req), res);
+        if (detection === undefined) return undefined;
+        const outcome = replayDetection(store, detection, { maxEvents: api.replayMaxEvents });
+        api.metrics.recordReplay(
+          outcome.verified ? "verified" : outcome.reason === "not_reproduced" ? "mismatch" : "unavailable"
+        );
+        return outcome;
+      })
+    );
+
+    app.post(
+      "/api/anomaly/detections/:id/feedback",
+      anomalyRoute((tenantId, req, res) => {
+        const detection = ownedDetection(tenantId, routeId(req), res);
+        if (detection === undefined) return undefined;
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const label = body["label"];
+        if (typeof label !== "string" || !(FEEDBACK_LABELS as readonly string[]).includes(label)) {
+          res.status(400).json({ error: `label must be one of ${FEEDBACK_LABELS.join(", ")}`, code: "invalid_label" });
+          return undefined;
+        }
+        const typedLabel = label as FeedbackLabel;
+        const existing = api.store.listFeedback(detection.id);
+        if (existing.length > 0 && !api.store.hasFeedback(detection.id, typedLabel)) {
+          // Two contradictory reviews of one detection make the budget a
+          // function of who looked last, so the first verdict stands.
+          res.status(409).json({ error: "detection already reviewed", code: "already_reviewed", label: existing[0]?.label });
+          return undefined;
+        }
+
+        let suppressedUntilMs: number | null = null;
+        if (typedLabel === "false_positive" && existing.length === 0) {
+          const requested = typeof body["suppress_ms"] === "number" ? body["suppress_ms"] : (api.suppressionTtlMs ?? DEFAULT_SUPPRESSION_TTL_MS);
+          const ttl = Math.min(30 * 24 * 60 * 60 * 1000, Math.max(0, Math.floor(requested)));
+          suppressedUntilMs = Date.now() + ttl;
+          api.store.suppress({
+            tenantId,
+            ruleId: detection.ruleId,
+            subjectKey: detection.subjectKey,
+            expiresAtMs: suppressedUntilMs,
+            reason: "operator_false_positive",
+          });
+        }
+
+        if (existing.length === 0) {
+          api.store.recordFeedback({
+            id: `fbr_${detection.id}`,
+            detectionId: detection.id,
+            tenantId,
+            label: typedLabel,
+            note: typeof body["note"] === "string" ? body["note"].slice(0, 500) : null,
+            createdAtMs: Date.now(),
+          });
+          api.metrics.recordFeedback(detection.ruleId, typedLabel);
+        }
+        return { detection_id: detection.id, label: typedLabel, suppressed_until_ms: suppressedUntilMs };
+      })
+    );
+
+    app.get(
+      "/api/anomaly/promotion",
+      anomalyRoute((tenantId) => {
+        const reports: PromotionReport[] = [];
+        for (const ruleId of RULE_IDS) {
+          const report = promotionReport(api.store, api.rules, tenantId, ruleId, Date.now());
+          api.metrics.recordPromotionReady(ruleId, tenantId, report.ready);
+          reports.push(report);
+        }
+        return { tenant_id: tenantId, reports };
+      })
+    );
+
+    app.post(
+      "/api/anomaly/rules/:ruleId/promote",
+      anomalyRoute((tenantId, req, res) => {
+        const ruleId = routeId(req, "ruleId");
+        const report = promotionReport(api.store, api.rules, tenantId, ruleId, Date.now());
+        api.metrics.recordPromotionReady(ruleId, tenantId, report.ready);
+        if (!report.ready) {
+          res.status(409).json({
+            error: "the rule has not been validated well enough to page on",
+            code: "promotion_not_ready",
+            reasons: report.reasons,
+            report,
+          });
+          return undefined;
+        }
+        const override: TenantRuleOverride = { ...api.store.getOverride(tenantId, ruleId), mode: "enforce" };
+        const rule = effectiveRule(ruleId, override);
+        api.store.setOverride(tenantId, ruleId, override, Date.now());
+        api.rules.invalidate(tenantId);
+        return { rule: ruleView(rule), report };
+      })
+    );
+
+    app.get(
+      "/api/anomaly/incidents",
+      anomalyRoute((tenantId) => {
+        const now = Date.now();
+        return {
+          tenant_id: tenantId,
+          incidents: api.engine
+            .openIncidentKeys()
+            .map((key) => parseIncidentKey(key))
+            .filter((parsed) => parsed.tenantId === tenantId)
+            .map((parsed) => ({ rule_id: parsed.ruleId, subject: redactSubject(parsed.subjectKey) })),
+          tracked_subjects: {
+            sender: api.engine.trackedSubjects("sender").length,
+            pair: api.engine.trackedSubjects("pair").length,
+          },
+          suppressions: api.store.listSuppressions(tenantId, now).map((record) => ({
+            rule_id: record.ruleId,
+            subject: redactSubject(record.subjectKey),
+            expires_at_ms: record.expiresAtMs,
+            reason: record.reason,
+          })),
+        };
+      })
+    );
+  }
+
   return app;
 }
 
@@ -710,6 +1039,69 @@ export async function run(): Promise<void> {
           ...sanitizeAttributes({ ...event, fingerprint: undefined, secret_fingerprint: event.fingerprint }),
         })
       ),
+  });
+
+  // ── Heuristic anomaly detection (issue #582) ───────────────────────────────
+  // Rules run on ledger-close time, so a restart has to rebuild the windows
+  // from the journal before a wide-window rule can be trusted again.
+  const anomalyMetrics = new AnomalyMetrics();
+  const anomalyRules = new TenantRuleSource({
+    store: store.anomaly,
+    directory,
+    base: ruleOverridesFromEnv(),
+    defaultMode: defaultModeFromEnv(),
+    defaultTenantId,
+  });
+  const anomalySinks: AnomalyAlertSink[] = [new LogAlertSink()];
+  if (process.env.ANOMALY_WEBHOOK_ALERTS !== "0") anomalySinks.push(new WebhookAlertSink(store.webhooks));
+  const anomalyEngine = new AnomalyEngine({
+    rules: anomalyRules,
+    store: store.anomaly,
+    sinks: [new FanOutAlertSink(anomalySinks)],
+    metrics: anomalyMetrics,
+    dedupOptions: {
+      flapWindowMs: envInt("ANOMALY_FLAP_WINDOW_MS", 120_000),
+      renotifyAfterMs: envNonNegativeInt("ANOMALY_RENOTIFY_AFTER_MS", 0),
+    },
+  });
+
+  const hydrateLedgers = envNonNegativeInt(HYDRATE_LEDGERS_ENV, 2_880);
+  const lastLedgerRaw = store.getState("lastLedger");
+  if (lastLedgerRaw !== undefined && hydrateLedgers > 0) {
+    const to = Number(lastLedgerRaw);
+    const page = store.eventsForAnomaly(Math.max(0, to - hydrateLedgers), to, envInt("ANOMALY_HYDRATE_MAX_EVENTS", 50_000));
+    if (page.truncated) {
+      console.warn(
+        `[indexer] anomaly windows hydrated from a truncated range; wide-window rules under-report until the pattern advances past it`
+      );
+    }
+    // Hydrate, do not re-observe: sweeping is muted while the historical range
+    // is replayed, because the restored incidents are not in the engine's live
+    // window set yet and an intermediate cycle would read a half-restored
+    // process as "everything resolved" and page a second time.
+    anomalyEngine.hydrate(
+      page.events
+        .map(toObservation)
+        .filter((observation): observation is Observation => observation !== null)
+    );
+  }
+
+  store.on("event", (event: DecodedEvent) => {
+    try {
+      anomalyEngine.observe(
+        toObservation({
+          id: event.id,
+          name: event.name,
+          ledger: event.ledger,
+          ledgerClosedAt: event.ledgerClosedAt,
+          streamId: event.streamId,
+          data: event.data as Record<string, unknown>,
+        })
+      );
+    } catch (error) {
+      // A detector failure must never take ingestion down with it.
+      console.error("[indexer] anomaly evaluation failed:", error);
+    }
   });
 
   // ── Checkpoint signer for `/streams/:id/proof` (#182) ──────────────────────
@@ -811,7 +1203,17 @@ export async function run(): Promise<void> {
       budget: manager.getRateBudget(),
     }),
     { networkPassphrase, contractId, signer: checkpointSigner },
-    { directory, registry: webhookRegistry, metrics: webhookMetrics, defaultTenantId }
+    { directory, registry: webhookRegistry, metrics: webhookMetrics, defaultTenantId },
+    {
+      engine: anomalyEngine,
+      store: store.anomaly,
+      rules: anomalyRules,
+      directory,
+      metrics: anomalyMetrics,
+      defaultTenantId,
+      suppressionTtlMs: envInt(SUPPRESSION_TTL_ENV, DEFAULT_SUPPRESSION_TTL_MS),
+      replayMaxEvents: envInt(REPLAY_MAX_EVENTS_ENV, DEFAULT_REPLAY_MAX_EVENTS),
+    }
   );
 
   async function poll(): Promise<void> {

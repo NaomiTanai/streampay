@@ -7,6 +7,7 @@ import { EVENT_KEYS } from "./generated/events.js";
 import { WebhookStore } from "./webhooks/store.js";
 import type { SecretCipher } from "./webhooks/secrets.js";
 import { OutboxStore, newOutboxEventFromDecoded } from "./outbox/store.js";
+import { AnomalyStore } from "./anomaly/store.js";
 import { globalIndexerTracer, traceCorrelationRegistry } from "./telemetry.js";
 
 export interface IngestSummary {
@@ -33,6 +34,7 @@ export class StreamStore extends EventEmitter {
   readonly db: Database.Database;
   readonly webhooks: WebhookStore;
   readonly outbox: OutboxStore;
+  readonly anomaly: AnomalyStore;
 
   constructor(path: string, options: StreamStoreOptions = {}) {
     super();
@@ -76,6 +78,7 @@ export class StreamStore extends EventEmitter {
     } catch {}
     this.webhooks = new WebhookStore(this.db, { cipher: options.webhookCipher ?? null });
     this.outbox = new OutboxStore(this.db);
+    this.anomaly = new AnomalyStore(this.db);
     this.allowNullStreamId();
   }
 
@@ -463,6 +466,53 @@ export class StreamStore extends EventEmitter {
     }
 
     return results;
+  }
+
+  /**
+   * The event journal inside a ledger range, oldest first, in the shape the
+   * anomaly rules read. Replay and hydration both go through here, so a cited
+   * range is verified against the same rows that produced the alert — including
+   * the `rowid` tiebreak, which makes the order total even when several events
+   * share a ledger.
+   */
+  eventsForAnomaly(
+    fromLedger: number,
+    toLedger: number,
+    limit: number
+  ): { events: Array<{ id: string; name: string; ledger: number; ledgerClosedAt: string; streamId: string | null; data: Record<string, unknown> }>; truncated: boolean } {
+    const rows = this.db
+      .prepare(
+        `SELECT id, name, ledger, ledger_closed_at, stream_id, payload FROM events
+         WHERE ledger >= ? AND ledger <= ? ORDER BY ledger ASC, rowid ASC LIMIT ?`
+      )
+      .all(fromLedger, toLedger, limit) as Array<{
+      id: string;
+      name: string;
+      ledger: number;
+      ledger_closed_at: string;
+      stream_id: string | null;
+      payload: string;
+    }>;
+
+    const truncated = rows.length === limit;
+    return {
+      events: rows.slice(0, truncated ? limit - 1 : limit).map((row) => {
+        let data: Record<string, unknown> = {};
+        try {
+          const parsed = JSON.parse(row.payload);
+          if (parsed !== null && typeof parsed === "object") data = parsed as Record<string, unknown>;
+        } catch {}
+        return {
+          id: row.id,
+          name: row.name,
+          ledger: Number(row.ledger),
+          ledgerClosedAt: row.ledger_closed_at,
+          streamId: row.stream_id,
+          data,
+        };
+      }),
+      truncated,
+    };
   }
 
   private toStream(row: Record<string, unknown>): Stream {

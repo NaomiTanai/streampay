@@ -391,16 +391,23 @@ export class WebhookStore {
   }
 
 
-  queueDeliveriesForEvent(event: {
-    id: string;
-    name: string;
-    /** `null` for the events that are not about a stream; subscribers matching
-     *  by event name still receive them, with the field present and null. */
-    streamId: string | null;
-    ledgerClosedAt: string;
-    data: Record<string, unknown>;
-  }): number {
-    const endpoints = this.listEndpoints().filter((ep) => ep.status === "active");
+  queueDeliveriesForEvent(
+    event: {
+      id: string;
+      name: string;
+      /** `null` for the events that are not about a stream; subscribers matching
+       *  by event name still receive them, with the field present and null. */
+      streamId: string | null;
+      ledgerClosedAt: string;
+      data: Record<string, unknown>;
+    },
+    /**
+     * Contract events are broadcast to every subscriber. An alert about one
+     * tenant's traffic is not, so a tenant-scoped fan-out has to say whose.
+     */
+    options: { tenantId?: string } = {}
+  ): number {
+    const endpoints = this.listEndpoints(options.tenantId).filter((ep) => ep.status === "active");
     let queued = 0;
     const now = Date.now();
 
