@@ -5,6 +5,7 @@ import { EventEmitter } from "node:events";
 import type { DecodedEvent, Stream } from "./types.js";
 import { EVENT_KEYS } from "./generated/events.js";
 import { WebhookStore } from "./webhooks/store.js";
+import type { SecretCipher } from "./webhooks/secrets.js";
 import { OutboxStore, newOutboxEventFromDecoded } from "./outbox/store.js";
 import { globalIndexerTracer, traceCorrelationRegistry } from "./telemetry.js";
 
@@ -19,12 +20,21 @@ export interface IngestSummary {
   projectionSkips: number;
 }
 
+export interface StreamStoreOptions {
+  /**
+   * Seals webhook signing secrets at rest. Unset keeps the historical
+   * plaintext columns, so a deployment that has not provisioned
+   * `WEBHOOK_SECRET_ENCRYPTION_KEY` still opens its existing database.
+   */
+  webhookCipher?: SecretCipher | null;
+}
+
 export class StreamStore extends EventEmitter {
   readonly db: Database.Database;
   readonly webhooks: WebhookStore;
   readonly outbox: OutboxStore;
 
-  constructor(path: string) {
+  constructor(path: string, options: StreamStoreOptions = {}) {
     super();
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.db = new Database(path);
@@ -64,7 +74,7 @@ export class StreamStore extends EventEmitter {
     try {
       this.db.exec("ALTER TABLE streams ADD COLUMN refund_target TEXT;");
     } catch {}
-    this.webhooks = new WebhookStore(this.db);
+    this.webhooks = new WebhookStore(this.db, { cipher: options.webhookCipher ?? null });
     this.outbox = new OutboxStore(this.db);
     this.allowNullStreamId();
   }

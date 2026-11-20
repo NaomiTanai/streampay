@@ -9,12 +9,22 @@ import { IngestPipeline, type EventsPage, type TickReport } from "./ingest/pipel
 import type { SequencerMetrics } from "./ingest/sequencer.js";
 import { WebhookDispatcher } from "./webhooks/dispatcher.js";
 import { validateWebhookUrl } from "./webhooks/ssrf.js";
+import { WebhookSubscriptionRegistry, SubscriptionError } from "./webhooks/registry.js";
+import { TenantDirectory, directoryFromEnv, type Principal } from "./webhooks/tenants.js";
+import { WebhookMetrics } from "./webhooks/metrics.js";
+import { SecretCipher } from "./webhooks/secrets.js";
+import { sanitizeAttributes, sanitizeError } from "./privacy.js";
 import { OutboxDispatcher } from "./outbox/dispatcher.js";
 import { OutboxMetrics } from "./outbox/metrics.js";
 import { httpPushTransport } from "./outbox/http-transport.js";
 import { traceCorrelationRegistry } from "./telemetry.js";
 import { createGracefulShutdown, installShutdownHandlers } from "./shutdown.js";
 import type { DecodedEvent, Stream } from "./types.js";
+
+/** Express types a path parameter as `string | string[]`; routes take one id. */
+function routeId(req: express.Request): string {
+  return String(req.params.id ?? "");
+}
 
 function parseCursor(raw: unknown): number {
   const value = Number(raw ?? 0);
@@ -40,6 +50,15 @@ function envNonNegativeInt(name: string, def: number): number {
   if (raw === undefined) return def;
   const value = Number(raw);
   if (!Number.isInteger(value) || value < 0) throw new Error(`${name} must be a non-negative integer`);
+  return value;
+}
+
+/** A fraction in [0, 1], the shape every SLA breach budget takes. */
+function envRatio(name: string, def: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return def;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0 || value > 1) throw new Error(`${name} must be a fraction between 0 and 1`);
   return value;
 }
 
@@ -70,6 +89,44 @@ export interface ProofConfig {
   signer: Keypair;
 }
 
+/**
+ * Tenant isolation for the webhook management API (issue #585). Supplied by
+ * `run()`; left out of `createApp` calls from tests, which then keep the
+ * historical single-tenant behaviour against the raw store.
+ */
+export interface WebhookApiConfig {
+  directory: TenantDirectory;
+  registry: WebhookSubscriptionRegistry;
+  metrics?: WebhookMetrics;
+  /** Tenant used when the deployment provisions no keys, i.e. trusts its transport. */
+  defaultTenantId?: string;
+}
+
+function bearerToken(header: string | string[] | undefined): string | undefined {
+  const raw = Array.isArray(header) ? header[0] : header;
+  if (!raw) return undefined;
+  const match = /^Bearer\s+(.+)$/i.exec(raw.trim());
+  return match ? match[1] : undefined;
+}
+
+/**
+ * Identify the caller of a webhook management request.
+ *
+ * With credentials provisioned, the tenant key is presented in
+ * `x-streampay-webhook-key` (or a bearer token) and the tenant comes from the
+ * directory — never from the request body, which is what makes the isolation
+ * unforgeable. With none provisioned the deployment is declaring itself
+ * single-tenant, so every request is that one tenant.
+ */
+function webhookPrincipal(config: WebhookApiConfig, req: express.Request): Principal | null {
+  if (!config.directory.enforcesAuthentication) {
+    return config.directory.principalFor(config.defaultTenantId ?? "default");
+  }
+  const header = req.headers["x-streampay-webhook-key"];
+  const presented = typeof header === "string" && header !== "" ? header : bearerToken(req.headers.authorization);
+  return config.directory.resolveKey(presented);
+}
+
 export function createApp(
   store: StreamStore,
   dispatcher?: WebhookDispatcher,
@@ -77,7 +134,8 @@ export function createApp(
   outboxMetrics?: OutboxMetrics,
   rpcHealth?: () => EndpointHealth[],
   ingestStats?: () => IngestStats,
-  proofConfig?: ProofConfig
+  proofConfig?: ProofConfig,
+  webhookApi?: WebhookApiConfig
 ): express.Express {
   const app = express();
   app.use(express.json());
@@ -228,7 +286,7 @@ export function createApp(
 
   // GET /streams/:id/history
   app.get("/streams/:id/history", (req, res) => {
-    const streamId = req.params.id;
+    const streamId = routeId(req);
     if (!streamId) {
       return res.json([]);
     }
@@ -238,8 +296,8 @@ export function createApp(
 
   // GET /streams/:id
   app.get("/streams/:id", (req, res) => {
-    if (!/^\d+$/.test(req.params.id)) return res.status(400).json({ error: "stream id must be an unsigned integer" });
-    const stream = store.getStream(req.params.id);
+    if (!/^\d+$/.test(routeId(req))) return res.status(400).json({ error: "stream id must be an unsigned integer" });
+    const stream = store.getStream(routeId(req));
     return stream ? res.json(stream) : res.status(404).json({ error: "stream not found" });
   });
 
@@ -250,9 +308,9 @@ export function createApp(
   // the canonical ledger-entry XDR, so the leaf the client re-hashes is the leaf
   // the chain would have produced.
   app.get("/streams/:id/proof", (req, res) => {
-    if (!/^\d+$/.test(req.params.id)) return res.status(400).json({ error: "stream id must be an unsigned integer" });
+    if (!/^\d+$/.test(routeId(req))) return res.status(400).json({ error: "stream id must be an unsigned integer" });
     if (!proofConfig) return res.status(503).json({ error: "proof endpoint is not configured: set CHECKPOINT_SIGNER_SECRET" });
-    const stream = store.getStream(req.params.id);
+    const stream = store.getStream(routeId(req));
     if (!stream) return res.status(404).json({ error: "stream not found" });
     const ledger = Number(store.getState("lastLedger") ?? stream.lastLedger);
     const ledgerCloseTime = Math.floor(new Date(stream.updatedAt).getTime() / 1000) || Math.floor(Date.now() / 1000);
@@ -262,7 +320,7 @@ export function createApp(
       ledger,
       ledgerCloseTime,
       streams: store.listAllStreams(),
-      targetStreamId: req.params.id,
+      targetStreamId: routeId(req),
       signer: proofConfig.signer,
     });
     return res.json(proof);
@@ -272,11 +330,11 @@ export function createApp(
   // Consumers replay from their last durable cursor; duplicates (at-least-once
   // transport) are detectable via the per-row idempotency_key and seq ordering.
   app.get("/streams/:id/events", (req, res) => {
-    if (!/^\d+$/.test(req.params.id)) return res.status(400).json({ error: "stream id must be an unsigned integer" });
+    if (!/^\d+$/.test(routeId(req))) return res.status(400).json({ error: "stream id must be an unsigned integer" });
     const after = parseCursor(req.query.after);
     if (after < 0) return res.status(400).json({ error: "after must be a non-negative integer cursor" });
     const limit = parseLimit(req.query.limit, 100, 1000);
-    return res.json(store.outbox.replayEvents(req.params.id, after, limit));
+    return res.json(store.outbox.replayEvents(routeId(req), after, limit));
   });
 
   // ---------- outbox management API ----------
@@ -307,19 +365,19 @@ export function createApp(
   });
 
   app.get("/api/outbox/consumers/:id", (req, res) => {
-    const consumer = store.outbox.getConsumer(req.params.id);
+    const consumer = store.outbox.getConsumer(routeId(req));
     return consumer ? res.json(consumer) : res.status(404).json({ error: "consumer not found" });
   });
 
   app.post("/api/outbox/consumers/:id/status", (req, res) => {
     const status = req.body?.status;
     if (status !== "active" && status !== "disabled") return res.status(400).json({ error: "status must be active or disabled" });
-    const ok = store.outbox.setConsumerStatus(req.params.id, status);
+    const ok = store.outbox.setConsumerStatus(routeId(req), status);
     return ok ? res.json({ ok: true }) : res.status(404).json({ error: "consumer not found" });
   });
 
   app.delete("/api/outbox/consumers/:id", (req, res) => {
-    const deleted = store.outbox.deleteConsumer(req.params.id);
+    const deleted = store.outbox.deleteConsumer(routeId(req));
     return deleted ? res.json({ ok: true }) : res.status(404).json({ error: "consumer not found" });
   });
 
@@ -337,7 +395,7 @@ export function createApp(
   });
 
   app.post("/api/outbox/intents/:id/replay", (req, res) => {
-    const id = Number(req.params.id);
+    const id = Number(routeId(req));
     if (!Number.isInteger(id) || id < 1) return res.status(400).json({ error: "intent id must be a positive integer" });
     const replayed = store.outbox.replayIntent(id);
     return replayed ? res.json({ ok: true }) : res.status(404).json({ error: "dead-letter intent not found" });
@@ -363,11 +421,14 @@ export function createApp(
 
   // Prometheus text exposition on the indexer's own surface.
   app.get("/metrics", (_req, res) => {
-    const body = outboxMetrics
-      ? outboxMetrics.render(store.outbox.stats())
-      : "# no outbox metrics configured\n";
+    const sections: string[] = [];
+    if (outboxMetrics) sections.push(outboxMetrics.render(store.outbox.stats()).trimEnd());
+    if (webhookApi?.metrics) {
+      sections.push(webhookApi.metrics.render(store.webhooks.deliveryStats()).trimEnd());
+    }
+    if (sections.length === 0) sections.push("# no metrics configured");
     res.setHeader("Content-Type", "text/plain; version=0.0.4");
-    return res.send(body);
+    return res.send(`${sections.join("\n")}\n`);
   });
 
   // GET /address/:addr/streams
@@ -378,72 +439,232 @@ export function createApp(
     return res.json({ address, count: streams.length, streams });
   });
 
-  // Webhook management API
-  app.get("/api/webhooks/endpoints", (_req, res) => {
-    res.json(store.webhooks.listEndpoints());
-  });
+  // ── Webhook management API ─────────────────────────────────────────────────
+  // With a registry configured every route is tenant-scoped: the tenant comes
+  // from the presented credential, another tenant's id reads as 404, and no
+  // response but the one that mints a secret ever carries secret material.
+  // Without one, the routes behave as they always did for a single-tenant
+  // deployment.
+  const tenantRoute =
+    (handler: (principal: Principal, req: express.Request, res: express.Response) => unknown | Promise<unknown>) =>
+    async (req: express.Request, res: express.Response): Promise<void> => {
+      let principal: Principal = { tenantId: "", keyId: "legacy", authenticated: false };
+      if (webhookApi) {
+        try {
+          principal = webhookPrincipal(webhookApi, req) ?? principal;
+          if (principal.keyId === "legacy") {
+            res.status(401).json({
+              error: "a tenant webhook key is required in x-streampay-webhook-key",
+              code: "unauthenticated",
+            });
+            return;
+          }
+        } catch (err: unknown) {
+          res.status(503).json({ error: sanitizeError(err), code: "tenant_unprovisioned" });
+          return;
+        }
+      }
+      try {
+        const result = await handler(principal, req, res);
+        if (result !== undefined && !res.headersSent) res.json(result);
+      } catch (err: unknown) {
+        if (err instanceof SubscriptionError) {
+          res.status(err.status).json(err.toJSON());
+          return;
+        }
+        res.status(500).json({ error: sanitizeError(err), code: "internal_error" });
+      }
+    };
 
-  app.post("/api/webhooks/endpoints", async (req, res) => {
-    const { url, events, secret } = req.body || {};
-    if (!url || typeof url !== "string") {
-      return res.status(400).json({ error: "URL is required" });
-    }
-    const ssrf = await validateWebhookUrl(url);
-    if (!ssrf.safe) {
-      return res.status(400).json({ error: `SSRF validation failed: ${ssrf.reason}` });
-    }
-    const endpoint = store.webhooks.createEndpoint({
-      url,
-      events: Array.isArray(events) ? events : ["*"],
-      secret: typeof secret === "string" ? secret : undefined,
-    });
-    return res.status(201).json(endpoint);
-  });
+  /** Registry-only routes answer 503 for a deployment that runs the legacy single-tenant store. */
+  const registryOnly = (res: express.Response): boolean => {
+    if (webhookApi) return true;
+    res.status(503).json({ error: "webhook registry not configured", code: "registry_unavailable" });
+    return false;
+  };
 
-  app.get("/api/webhooks/endpoints/:id", (req, res) => {
-    const ep = store.webhooks.getEndpoint(req.params.id);
-    if (!ep) return res.status(404).json({ error: "Endpoint not found" });
-    return res.json(ep);
-  });
+  app.get(
+    "/api/webhooks/endpoints",
+    tenantRoute((principal) => {
+      if (!webhookApi) return store.webhooks.listEndpoints();
+      return webhookApi.registry.list(principal).subscriptions;
+    })
+  );
 
-  app.post("/api/webhooks/endpoints/:id/rotate-secret", (req, res) => {
-    try {
-      const result = store.webhooks.rotateEndpointSecret(req.params.id);
-      return res.json(result);
-    } catch (err: unknown) {
-      return res.status(404).json({ error: err instanceof Error ? err.message : String(err) });
-    }
-  });
+  app.post(
+    "/api/webhooks/endpoints",
+    tenantRoute(async (principal, req, res) => {
+      if (!webhookApi) {
+        const { url, events, secret } = req.body || {};
+        if (!url || typeof url !== "string") {
+          res.status(400).json({ error: "URL is required" });
+          return;
+        }
+        const ssrf = await validateWebhookUrl(url);
+        if (!ssrf.safe) {
+          res.status(400).json({ error: `SSRF validation failed: ${ssrf.reason}` });
+          return;
+        }
+        return store.webhooks.createEndpoint({
+          url,
+          events: Array.isArray(events) ? events : ["*"],
+          secret: typeof secret === "string" ? secret : undefined,
+        });
+      }
+      const { url, events, secret } = req.body || {};
+      const created = await webhookApi.registry.create(principal, {
+        url,
+        events: Array.isArray(events) ? events : undefined,
+        secret: typeof secret === "string" ? secret : undefined,
+      });
+      // The signing secret is disclosed here and never again.
+      res.status(201);
+      return { ...created.subscription, secret: created.secret_once };
+    })
+  );
 
-  app.delete("/api/webhooks/endpoints/:id", (req, res) => {
-    const deleted = store.webhooks.deleteEndpoint(req.params.id);
-    if (!deleted) return res.status(404).json({ error: "Endpoint not found" });
-    return res.json({ ok: true });
-  });
+  app.get(
+    "/api/webhooks/endpoints/:id",
+    tenantRoute((principal, req, res) => {
+      if (!webhookApi) {
+        const ep = store.webhooks.getEndpoint(routeId(req));
+        if (!ep) {
+          res.status(404).json({ error: "Endpoint not found" });
+          return;
+        }
+        return ep;
+      }
+      return webhookApi.registry.get(principal, routeId(req));
+    })
+  );
 
-  app.post("/api/webhooks/endpoints/:id/test", async (req, res) => {
-    if (!dispatcher) {
-      return res.status(500).json({ error: "Webhook dispatcher not configured" });
-    }
-    const result = await dispatcher.testFireEndpoint(req.params.id);
-    return res.json(result);
-  });
+  app.patch(
+    "/api/webhooks/endpoints/:id",
+    tenantRoute(async (principal, req, res) => {
+      if (!registryOnly(res)) return;
+      const { url, events, status } = req.body || {};
+      return webhookApi!.registry.update(principal, routeId(req), {
+        url,
+        events: Array.isArray(events) ? events : undefined,
+        status: status === "active" || status === "disabled" ? status : undefined,
+      });
+    })
+  );
 
-  app.get("/api/webhooks/deliveries", (req, res) => {
-    const limit = Math.min(100, Math.max(1, Number(req.query.limit || 50)));
-    return res.json(store.webhooks.listDeliveries(limit));
-  });
+  app.post(
+    "/api/webhooks/endpoints/:id/rotate-secret",
+    tenantRoute((principal, req, res) => {
+      if (!webhookApi) {
+        try {
+          return store.webhooks.rotateEndpointSecret(routeId(req));
+        } catch (err: unknown) {
+          res.status(404).json({ error: sanitizeError(err) });
+          return;
+        }
+      }
+      const rotated = webhookApi.registry.rotateSecret(principal, routeId(req));
+      return {
+        secret: rotated.secret_once,
+        previous_secret: null,
+        fingerprint: rotated.fingerprint,
+        previous_fingerprint: rotated.previous_fingerprint,
+        expires_at: rotated.expires_at,
+      };
+    })
+  );
 
-  app.get("/api/webhooks/dlq", (req, res) => {
-    const limit = Math.min(100, Math.max(1, Number(req.query.limit || 50)));
-    return res.json(store.webhooks.listDLQ(limit));
-  });
+  app.get(
+    "/api/webhooks/endpoints/:id/rotations",
+    tenantRoute((principal, req, res) => {
+      if (!registryOnly(res)) return;
+      return webhookApi!.registry.rotationHistory(principal, routeId(req), parseLimit(req.query.limit, 20, 100));
+    })
+  );
 
-  app.post("/api/webhooks/dlq/:id/retry", (req, res) => {
-    const success = store.webhooks.replayDLQItem(req.params.id);
-    if (!success) return res.status(404).json({ error: "DLQ item not found" });
-    return res.json({ ok: true, replayed: true });
-  });
+  app.get(
+    "/api/webhooks/quota",
+    tenantRoute((principal, _req, res) => {
+      if (!registryOnly(res)) return;
+      return webhookApi!.registry.list(principal).quota;
+    })
+  );
+
+  app.delete(
+    "/api/webhooks/endpoints/:id",
+    tenantRoute((principal, req, res) => {
+      if (!webhookApi) {
+        const deleted = store.webhooks.deleteEndpoint(routeId(req));
+        if (!deleted) {
+          res.status(404).json({ error: "Endpoint not found" });
+          return;
+        }
+        return { ok: true };
+      }
+      return webhookApi.registry.remove(principal, routeId(req));
+    })
+  );
+
+  app.post(
+    "/api/webhooks/endpoints/:id/test",
+    tenantRoute(async (principal, req, res) => {
+      if (!dispatcher) {
+        res.status(503).json({ error: "Webhook dispatcher not configured", code: "dispatcher_unavailable" });
+        return;
+      }
+      // Ownership is checked before the dispatcher, which is tenant-blind.
+      if (webhookApi) webhookApi.registry.get(principal, routeId(req));
+      return await dispatcher.testFireEndpoint(routeId(req));
+    })
+  );
+
+  app.get(
+    "/api/webhooks/deliveries",
+    tenantRoute((principal, req) => {
+      const limit = Math.min(100, Math.max(1, Number(req.query.limit || 50)));
+      if (!webhookApi) return store.webhooks.listDeliveries(limit);
+      return webhookApi.registry.deliveries(principal, limit);
+    })
+  );
+
+  app.get(
+    "/api/webhooks/dlq",
+    tenantRoute((principal, req) => {
+      const limit = Math.min(100, Math.max(1, Number(req.query.limit || 50)));
+      if (!webhookApi) return store.webhooks.listDLQ(limit);
+      return webhookApi.registry.dlq(principal, limit);
+    })
+  );
+
+  app.post(
+    "/api/webhooks/dlq/:id/retry",
+    tenantRoute((principal, req, res) => {
+      if (!webhookApi) {
+        const success = store.webhooks.replayDLQItem(routeId(req));
+        if (!success) {
+          res.status(404).json({ error: "DLQ item not found" });
+          return;
+        }
+        return { ok: true, replayed: true };
+      }
+      return webhookApi.registry.replayDlq(principal, routeId(req));
+    })
+  );
+
+  app.get(
+    "/api/webhooks/sla",
+    tenantRoute((principal, _req, res) => {
+      if (!registryOnly(res)) return;
+      return webhookApi!.registry.sla(principal);
+    })
+  );
+
+  app.post(
+    "/api/webhooks/rotations/expire",
+    tenantRoute((_principal, _req, res) => {
+      if (!registryOnly(res)) return;
+      return webhookApi!.registry.retireExpiredRotations();
+    })
+  );
 
   return app;
 }
@@ -458,7 +679,38 @@ export async function run(): Promise<void> {
   if (!contractId) throw new Error("CONTRACT_ID is required");
   if (!Number.isFinite(pollInterval) || pollInterval < 250) throw new Error("POLL_INTERVAL_MS must be at least 250");
 
-  const store = new StreamStore(dbPath);
+  const webhookCipher = SecretCipher.fromEnv();
+  if (webhookCipher === null) {
+    console.warn(
+      "[indexer] WEBHOOK_SECRET_ENCRYPTION_KEY is unset: webhook signing secrets are stored in the clear. " +
+        "Set it to a 32-byte hex key before serving more than one tenant."
+    );
+  }
+  const store = new StreamStore(dbPath, { webhookCipher });
+
+  const { directory, defaultTenantId } = directoryFromEnv();
+  const webhookMetrics = new WebhookMetrics({
+    slaMs: envInt("WEBHOOK_SLA_MS", 5_000),
+    breachBudget: envRatio("WEBHOOK_SLA_BREACH_BUDGET", 0.01),
+    minSamples: envInt("WEBHOOK_SLA_MIN_SAMPLES", 20),
+  });
+  const webhookRegistry = new WebhookSubscriptionRegistry({
+    store: store.webhooks,
+    directory,
+    metrics: webhookMetrics,
+    rotationOverlapMs: envInt("WEBHOOK_SECRET_ROTATION_OVERLAP_MS", 24 * 60 * 60 * 1000),
+    requireEncryption: process.env.WEBHOOK_REQUIRE_ENCRYPTION === "1",
+    // One JSON line per registry action, with the URL masked and the secret
+    // represented only by its fingerprint.
+    onAudit: (event) =>
+      console.log(
+        JSON.stringify({
+          service: "streampay-indexer",
+          component: "webhooks",
+          ...sanitizeAttributes({ ...event, fingerprint: undefined, secret_fingerprint: event.fingerprint }),
+        })
+      ),
+  });
 
   // ── Checkpoint signer for `/streams/:id/proof` (#182) ──────────────────────
   // An ephemeral `Keypair.random()` keeps a throwaway indexer running, but its
@@ -486,7 +738,7 @@ export async function run(): Promise<void> {
     timeoutMs: 20_000,
   });
 
-  const dispatcher = new WebhookDispatcher(store.webhooks);
+  const dispatcher = new WebhookDispatcher(store.webhooks, 2000, { metrics: webhookMetrics });
   dispatcher.start();
 
   const outboxMetrics = new OutboxMetrics({
@@ -558,7 +810,8 @@ export async function run(): Promise<void> {
       sequencer: pipeline.metrics(),
       budget: manager.getRateBudget(),
     }),
-    { networkPassphrase, contractId, signer: checkpointSigner }
+    { networkPassphrase, contractId, signer: checkpointSigner },
+    { directory, registry: webhookRegistry, metrics: webhookMetrics, defaultTenantId }
   );
 
   async function poll(): Promise<void> {
