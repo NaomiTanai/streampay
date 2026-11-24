@@ -41,6 +41,10 @@ import { RULE_IDS, RuleConfigError, effectiveRule, type EffectiveRule } from "./
 import { DEFAULT_REPLAY_MAX_EVENTS, replayDetection } from "./anomaly/replay.js";
 import { toObservation } from "./anomaly/observations.js";
 import { FEEDBACK_LABELS, type Detection, type FeedbackLabel, type Observation, type RuleMode, type TenantRuleOverride } from "./anomaly/types.js";
+import { AnalyticsMetrics } from "./analytics/metrics.js";
+import { AnalyticsRefresher } from "./analytics/refresh.js";
+import { registerAnalyticsRoutes, type AnalyticsApiConfig } from "./analytics/api.js";
+import { ANALYTICS_ENV, DEFAULT_ANALYTICS_CONFIG } from "./analytics/types.js";
 import { GrpcIndexerServer } from "./grpc/server.js";
 import { loadRotationConfig, rpcAuthHeaders } from "./secrets/config.js";
 import { WebhookKeyRotation } from "./secrets/rotation.js";
@@ -262,7 +266,7 @@ export interface HistoryOptions {
   redactAddresses?: boolean;
 }
 
-type FeatureApiConfig = WebhookApiConfig | AnomalyApiConfig;
+type FeatureApiConfig = WebhookApiConfig | AnomalyApiConfig | AnalyticsApiConfig;
 type OptionalApiConfig = GraphQLHandlerOptions | WasmOptions | HistoryOptions | FeatureApiConfig;
 
 function isWebhookApiConfig(value: OptionalApiConfig | undefined): value is WebhookApiConfig {
@@ -273,8 +277,12 @@ function isAnomalyApiConfig(value: OptionalApiConfig | undefined): value is Anom
   return value !== undefined && "engine" in value;
 }
 
+function isAnalyticsApiConfig(value: OptionalApiConfig | undefined): value is AnalyticsApiConfig {
+  return value !== undefined && "refresher" in value;
+}
+
 function isFeatureApiConfig(value: OptionalApiConfig | undefined): value is FeatureApiConfig {
-  return isWebhookApiConfig(value) || isAnomalyApiConfig(value);
+  return isWebhookApiConfig(value) || isAnomalyApiConfig(value) || isAnalyticsApiConfig(value);
 }
 
 export function createApp(
@@ -289,20 +297,23 @@ export function createApp(
   wasmOptions?: WasmOptions | FeatureApiConfig,
   historyOptions?: HistoryOptions | FeatureApiConfig,
   webhookApi?: WebhookApiConfig,
-  anomalyApi?: AnomalyApiConfig
+  anomalyApi?: AnomalyApiConfig,
+  analyticsApi?: AnalyticsApiConfig
 ): express.Express {
-  // Before the upstream transports were added, slots 8–9 held the webhook and
-  // anomaly configs. Recognise those shapes while retaining the upstream
-  // GraphQL/WASM/history positions and the appended feature slots.
+  // Before the upstream transports were added, slots 8–10 held the webhook,
+  // anomaly and analytics configs. Recognise those shapes while retaining the
+  // upstream GraphQL/WASM/history positions and the appended feature slots.
   for (const option of [graphqlOptions, wasmOptions, historyOptions]) {
     if (isWebhookApiConfig(option)) webhookApi ??= option;
     else if (isAnomalyApiConfig(option)) anomalyApi ??= option;
+    else if (isAnalyticsApiConfig(option)) analyticsApi ??= option;
   }
   if (isFeatureApiConfig(graphqlOptions)) graphqlOptions = undefined;
   if (isFeatureApiConfig(wasmOptions)) wasmOptions = undefined;
   if (isFeatureApiConfig(historyOptions)) historyOptions = undefined;
 
   const app = express();
+  app.set("trust proxy", analyticsApi?.trustProxyHops ?? 0);
   app.use(express.json());
 
   // GraphQL read API over the same projections (#576). REST routes below
@@ -729,6 +740,8 @@ export function createApp(
 
   app.get("/api/outbox/stats", (_req, res) => res.json(store.outbox.stats()));
 
+  if (analyticsApi) registerAnalyticsRoutes(app, store.analytics, analyticsApi);
+
   app.post("/api/outbox/flush", async (_req, res) => {
     if (!outboxDispatcher) return res.status(503).json({ error: "outbox dispatcher not configured" });
     return res.json(await outboxDispatcher.tick());
@@ -742,6 +755,7 @@ export function createApp(
       sections.push(webhookApi.metrics.render(store.webhooks.deliveryStats()).trimEnd());
     }
     if (anomalyApi) sections.push(anomalyApi.metrics.render().trimEnd());
+    if (analyticsApi && analyticsApi.enabled !== false) sections.push(analyticsApi.metrics.render(store.analytics.snapshot()).trimEnd());
     if (sections.length === 0) sections.push("# no metrics configured");
     res.setHeader("Content-Type", "text/plain; version=0.0.4");
     return res.send(`${sections.join("\n")}\n`);
@@ -1313,8 +1327,27 @@ export async function run(): Promise<void> {
         "Set it to a 32-byte hex key before serving more than one tenant."
     );
   }
+  const analyticsEnabled = process.env[ANALYTICS_ENV.enabled] !== "0";
   const initialLedger = configuredStartLedger();
-  const store = new StreamStore(dbPath, { webhookCipher });
+  if (analyticsEnabled && initialLedger === undefined) {
+    throw new Error("START_LEDGER must name a ledger before the contract's first event when analytics is enabled");
+  }
+  const analyticsConfig = {
+    bucketMs: envInt(ANALYTICS_ENV.bucketMs, DEFAULT_ANALYTICS_CONFIG.bucketMs),
+    refreshIntervalMs: envInt(ANALYTICS_ENV.refreshMs, DEFAULT_ANALYTICS_CONFIG.refreshIntervalMs),
+    batchSize: envInt(ANALYTICS_ENV.batchSize, DEFAULT_ANALYTICS_CONFIG.batchSize),
+    sloMs: envInt(ANALYTICS_ENV.sloMs, DEFAULT_ANALYTICS_CONFIG.sloMs),
+    maxWaitMs: envNonNegativeInt(ANALYTICS_ENV.maxWaitMs, DEFAULT_ANALYTICS_CONFIG.maxWaitMs),
+    waitPollMs: envInt(ANALYTICS_ENV.waitPollMs, DEFAULT_ANALYTICS_CONFIG.waitPollMs),
+    throughputBudgetPerSecond: envInt(ANALYTICS_ENV.budgetEps, DEFAULT_ANALYTICS_CONFIG.throughputBudgetPerSecond),
+  };
+  const store = new StreamStore(dbPath, {
+    webhookCipher,
+    analytics: { config: analyticsConfig, historyStartLedger: initialLedger, certifyHistory: analyticsEnabled },
+  });
+  const analyticsMetrics = new AnalyticsMetrics();
+  const analyticsRefresher = new AnalyticsRefresher(store.analytics, analyticsMetrics);
+  if (analyticsEnabled) analyticsRefresher.start();
 
   const { directory, defaultTenantId } = directoryFromEnv();
   const webhookMetrics = new WebhookMetrics({
@@ -1489,8 +1522,12 @@ export async function run(): Promise<void> {
     "stream_topped_up",
     "stream_paused",
     "stream_resumed",
+    "rate_change_accepted",
+    "ownership_accepted",
+    "sender_transferred",
     "stream_refund_target_changed",
     "batch_withdraw_summary",
+    "streams_created",
   ];
   const topicFilters = eventNames.map((name) => [nativeToScVal(name, { type: "symbol" }).toXDR("base64")]);
 
@@ -1546,6 +1583,14 @@ export async function run(): Promise<void> {
       defaultTenantId,
       suppressionTtlMs: envInt(SUPPRESSION_TTL_ENV, DEFAULT_SUPPRESSION_TTL_MS),
       replayMaxEvents: envInt(REPLAY_MAX_EVENTS_ENV, DEFAULT_REPLAY_MAX_EVENTS),
+    },
+    {
+      refresher: analyticsRefresher,
+      metrics: analyticsMetrics,
+      enabled: analyticsEnabled,
+      apiToken: process.env[ANALYTICS_ENV.apiToken]?.trim() || undefined,
+      mutationRateLimitPerSecond: Math.max(1, envInt(ANALYTICS_ENV.mutationRate, 5)),
+      trustProxyHops: envNonNegativeInt("TRUST_PROXY_HOPS", 0),
     }
   );
 
@@ -1602,6 +1647,7 @@ export async function run(): Promise<void> {
     stopAccepting: () => {
       shuttingDown = true;
       clearInterval(pollTimer);
+      analyticsRefresher.stop();
       server.close();
       // SSE streams never end on their own; without this `close()` would wait forever.
       server.closeAllConnections();

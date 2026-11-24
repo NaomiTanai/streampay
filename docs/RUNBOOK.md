@@ -31,6 +31,12 @@ This runbook carries an end-to-end worked example of onboarding a **50-employee 
 | `IndexerWebhookTenantSlaBreached`  | Warning (P2)      | Indexer Webhooks | Every tenant window under budget          | [#indexerwebhooktenantslabreached](#indexerwebhooktenantslabreached) |
 | `IndexerWebhookSlaBreachedSustained` | Critical (P1)   | Indexer Webhooks | Breach cleared inside one retry cohort    | [#indexerwebhookslabreachedsustained](#indexerwebhookslabreachedsustained) |
 | `IndexerWebhookBacklogAging`       | Warning (P2)      | Indexer Webhooks | Oldest pending delivery < 60s at steady state | [#indexerwebhookbacklogaging](#indexerwebhookbacklogaging)       |
+| `IndexerAnalyticsStalenessBreach` | Warning (P2)      | Indexer Analytics | Each view inside configured event-time SLO    | [#indexeranalyticsstalenessbreach](#indexeranalyticsstalenessbreach) |
+| `IndexerAnalyticsStalenessCritical` | Critical (P1)   | Indexer Analytics | SLO violation = 0s                           | [#indexeranalyticsstalenesscritical](#indexeranalyticsstalenesscritical) |
+| `IndexerAnalyticsDirty`            | Critical (P1)     | Indexer Analytics | Rebuild completes on next refresh tick        | [#indexeranalyticsdirty](#indexeranalyticsdirty)               |
+| `IndexerAnalyticsRefreshErrors`    | Warning (P2)      | Indexer Analytics | 0 failed refresh transactions                | [#indexeranalyticsrefresherrors](#indexeranalyticsrefresherrors)   |
+| `IndexerAnalyticsThroughputShortfall` | Warning (P2)  | Indexer Analytics | Refresh sustains 500 events/s in budget test | [#indexeranalyticsthroughputshortfall](#indexeranalyticsthroughputshortfall) |
+| `IndexerAnalyticsGatedReadFailures` | Warning (P2)    | Indexer Analytics | 0 timed-out gated reads                      | [#indexeranalyticsgatedreadfailures](#indexeranalyticsgatedreadfailures) |
 
 ## Table of Contents
 
@@ -75,6 +81,14 @@ This runbook carries an end-to-end worked example of onboarding a **50-employee 
    - [`IndexerWebhookTenantSlaBreached`](#indexerwebhooktenantslabreached)
    - [`IndexerWebhookSlaBreachedSustained`](#indexerwebhookslabreachedsustained)
    - [`IndexerWebhookBacklogAging`](#indexerwebhookbacklogaging)
+10. [Materialized Analytics Alert Triage](#10-materialized-analytics-alert-triage)
+   - [10.1 Establish whether the writer is moving](#101-establish-whether-the-writer-is-moving)
+   - [`IndexerAnalyticsStalenessBreach`](#indexeranalyticsstalenessbreach)
+   - [`IndexerAnalyticsStalenessCritical`](#indexeranalyticsstalenesscritical)
+   - [`IndexerAnalyticsDirty`](#indexeranalyticsdirty)
+   - [`IndexerAnalyticsRefreshErrors`](#indexeranalyticsrefresherrors)
+   - [`IndexerAnalyticsThroughputShortfall`](#indexeranalyticsthroughputshortfall)
+   - [`IndexerAnalyticsGatedReadFailures`](#indexeranalyticsgatedreadfailures)
 
 ---
 
@@ -1175,3 +1189,130 @@ alerts still fire, but read them as "the one subscriber is us".
 4. If aging is chronic at healthy volume, the retry schedule is fighting the
    dispatch budget — revisit `WEBHOOK_SLA_MIN_SAMPLES` only so the SLA gauge
    starts reporting sooner, never to make this alert quieter.
+
+---
+
+## 10. Materialized Analytics Alert Triage
+
+These alerts cover the outbox-driven portfolio views specified in
+[docs/ANALYTICS.md](./ANALYTICS.md). A stale view is not necessarily lost data:
+the journal remains the source of truth, the watermark identifies the last
+committed fold position, and an atomic rebuild can recover it. It is, however,
+unsafe to present the view as current.
+
+### 10.1 Establish whether the writer is moving
+
+1. Read `GET /api/analytics/views` or scrape `streampay_analytics_lag_events`,
+   `streampay_analytics_staleness_seconds`, and `streampay_analytics_dirty`.
+   Separate **event lag** (unfolded journal rows) from **event-time age** (how
+   old the watermark event is). A quiet chain can age a view without lag.
+2. Read `GET /api/analytics/refresh/stats`. Check `errors`, `last_error`,
+   `watermark_seq`, `journal_seq`, `events_per_second`, and the worker's
+   `capped_ticks`. Two scrapes with an advancing watermark mean the writer is
+   healthy but behind; a flat watermark with rising lag means it is stalled.
+3. Check the shared indexer ingestion and SQLite health. Analytics uses the same
+   process/database as ingestion and the outbox. Do not restart repeatedly while
+   a transaction is still committing.
+4. Preserve freshness gates. Never answer `stale_view` with ungated rows just to
+   clear a dashboard alarm; that hides the consistency failure from clients.
+5. If startup refuses a pre-existing database with a complete-history error,
+   stop ingestion, set `START_LEDGER` before the contract's first event, and
+   reindex into a fresh database. Older outbox rows lack newly subscribed events;
+   do not set the marker by hand or append a historical backfill at the journal
+   tail.
+
+### `IndexerAnalyticsStalenessBreach`
+
+- **Severity**: Warning (P2)
+- **Condition**: any `streampay_analytics_slo_breach{view}` is `1` for 5 minutes.
+- **User impact**: a view is older than `ANALYTICS_SLO_MS` or more than one
+  `ANALYTICS_BATCH_SIZE` behind. Clients requesting freshness can time out.
+
+#### Diagnosis and remediation
+
+1. If lag is rising, compare `events_per_second` with
+   `streampay_analytics_budget_events_per_second` and sustained ingestion. Follow
+   the throughput-shortfall procedure below.
+2. If lag is zero but age is rising, check the ledger timestamp of the journal
+   head and the configured SLO. On a halted chain this is expected aging, not a
+   fold bug; do not trigger endless rebuilds.
+3. If a bucket-width change preceded the incident, run one manual rebuild and
+   verify parity. Bucket configuration is not a live semantic switch.
+4. If only one view is dirty, treat it as reorg recovery and follow the dirty
+   procedure. All four views normally share one fold watermark.
+
+### `IndexerAnalyticsStalenessCritical`
+
+- **Severity**: Critical (P1)
+- **Condition**: `streampay_analytics_slo_violation_seconds > 60` for 5 minutes.
+- **User impact**: sustained, material loss of freshness beyond the promised SLO.
+
+Stop serving the affected dashboard as current, preserve the journal, and fix
+the writer bottleneck before rebuilding. After watermarks catch up, compare
+`GET /api/analytics/assets` with a naive scan over the same journal range and
+record both the lag and the duration of the breach. Raising the SLO is not a
+remediation unless the product commitment is deliberately being changed.
+
+### `IndexerAnalyticsDirty`
+
+- **Severity**: Critical (P1)
+- **Condition**: `streampay_analytics_dirty == 1` for 2 minutes.
+- **User impact**: a retraction made previously applied events untrue; gated
+  reads are blocked until a rebuild publishes the surviving journal.
+
+1. Confirm the reorg through the outbox retraction record and reconciler. Do not
+   clear the marker or edit view rows by hand.
+2. Inspect `last_error`. A failed rebuild leaves the views at their previous
+   complete fold position; restore database/storage health first.
+3. The next worker tick normally rebuilds automatically. If the journal is
+   stable and storage is healthy, call `POST /api/analytics/rebuild` with an
+   incident reason and verify `dirty` becomes `0`.
+4. Confirm the watermark does not pass retracted rows and spot-check funded,
+   claimed, settled, and refunded totals before reopening gated reads.
+
+### `IndexerAnalyticsRefreshErrors`
+
+- **Severity**: Warning (P2)
+- **Condition**: `increase(streampay_analytics_errors_total[5m]) > 0`.
+- **User impact**: one or more folds rolled back. The previous watermark is
+  still truthful, but the backlog or dirty state may now violate the SLO.
+
+Use `last_error` to distinguish SQLite/storage failure from an invalid fold
+input. Refresh writes measures, dimensions, and watermark in one transaction,
+so a crash does not leave a partially applied batch. Retrying is safe: either
+the original transaction committed and its watermark advanced, or it rolled
+back and the same rows are eligible again. Repeated failures with a flat
+watermark require storage diagnosis, not a rebuild loop.
+
+### `IndexerAnalyticsThroughputShortfall`
+
+- **Severity**: Warning (P2)
+- **Condition**: journal lag is nonzero while the latest batch sustains less
+  than 80% of `ANALYTICS_THROUGHPUT_BUDGET_EPS` for 10 minutes.
+- **User impact**: catch-up is slower than the configured capacity promise and
+  will eventually breach freshness.
+
+1. Rule out an idle or tiny batch before changing capacity; the alert already
+   requires outstanding rows, but the last-batch rate is still a coarse gauge.
+2. Check `capped_ticks`. Frequent caps with an advancing watermark mean the
+   budget is protecting ingestion as intended; size the budget for sustained
+   ingest plus recovery headroom.
+3. Check SQLite lock duration and disk latency. Increase `ANALYTICS_BATCH_SIZE`
+   only if larger transactions do not starve ingestion; increasing it does not
+   raise the events/second budget by itself.
+4. After changing capacity, verify `lag_events` trends down and gated-read
+   failures clear. Do not disable the worker to relieve write contention.
+
+### `IndexerAnalyticsGatedReadFailures`
+
+- **Severity**: Warning (P2)
+- **Condition**: more than 5% of gated reads time out over ten minutes.
+- **User impact**: callers cannot obtain a portfolio at their requested ledger
+  or event lag.
+
+Correlate the failures with SLO and throughput alerts. If all views are behind,
+fix the writer. If one caller alone requests an impossible `min_ledger`, correct
+the caller rather than relaxing the fleet's gates. `wait_ms` is capped by
+`ANALYTICS_MAX_WAIT_MS`; increasing either only masks a slow writer and consumes
+request capacity. Once healthy, verify a request at the current ledger succeeds
+and reports `waited_ms` consistent with actual catch-up.

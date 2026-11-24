@@ -7,7 +7,7 @@
 
 The StreamPay Event Indexer is a standalone TypeScript Node.js service that polls Soroban RPC `getEvents` for StreamPay smart contract events, decodes the contract's typed XDR event payloads using `@stellar/stellar-sdk`, persists stream metadata and an append-only event log in SQLite, maintains cursor persistence, and serves a lightweight HTTP query API.
 
-The service indexes the contract's emitted event topics: `stream_created`, `withdrawn`, `stream_cancelled`, and `stream_topped_up` (the Rust event types are `StreamCreated`, `Withdrawn`, `StreamCancelled`, and `StreamToppedUp`). It also recognizes `stream_paused` and `stream_resumed` for forward-compatible status updates. Unknown topics are filtered out at RPC.
+The service indexes stream lifecycle, withdrawal, rate-change, ownership, refund-target, and batch-summary event topics. Unknown topics are filtered out at RPC. It also maintains incremental portfolio analytics over the transactional outbox journal; see [docs/ANALYTICS.md](../docs/ANALYTICS.md).
 
 ---
 
@@ -25,7 +25,7 @@ The service indexes the contract's emitted event topics: `stream_created`, `with
 | `POLL_INTERVAL_MS` | `5000` | Delay between polls (minimum 250 ms) |
 | `PORT` | `8787` | HTTP listen port |
 | `DATABASE_PATH` | `./data/streampay.sqlite` | SQLite database file |
-| `START_LEDGER` | Latest RPC ledger | Initial ledger sequence if starting fresh without a saved cursor |
+| `START_LEDGER` | Latest RPC ledger | Initial ledger sequence if starting fresh without a saved cursor; required before the contract's first event when analytics is enabled |
 | `GRPC_PORT` | `8788` | gRPC (HTTP/2) listen port; `0` disables the gRPC transport |
 | `GRPC_MAX_SUBSCRIPTIONS_PER_TENANT` | `5` | Max concurrent gRPC subscriptions per tenant |
 | `GRPC_MAX_EVENTS_PER_SECOND_PER_TENANT` | `100` | Per-tenant gRPC rate budget (token bucket, events/second) |
@@ -54,6 +54,17 @@ The service indexes the contract's emitted event topics: `stream_created`, `with
 | `ANOMALY_SUPPRESSION_TTL_MS` | `86400000` | How long a `false_positive` review suppresses its subject (clamped to 30 days) |
 | `ANOMALY_REPLAY_MAX_EVENTS` | `50000` | Rows one replay may read, so a citation cannot become a DoS |
 | `ANOMALY_WEBHOOK_ALERTS` | on | `0` keeps anomaly alerts in the log instead of fanning out `anomaly_alert` deliveries |
+| `ANALYTICS_ENABLED` | on | `0` disables the analytics worker and operational API |
+| `ANALYTICS_BUCKET_MS` | `3600000` | Accrual/rate-ladder bucket width |
+| `ANALYTICS_REFRESH_MS` | `1000` | Incremental analytics refresh cadence |
+| `ANALYTICS_BATCH_SIZE` | `500` | Journal rows folded per transaction |
+| `ANALYTICS_SLO_MS` | `30000` | Maximum view event-time age (and one batch of lag) |
+| `ANALYTICS_MAX_WAIT_MS` | `5000` | Maximum wait for a freshness-gated read |
+| `ANALYTICS_WAIT_POLL_MS` | `50` | Poll interval for a waiting read |
+| `ANALYTICS_THROUGHPUT_BUDGET_EPS` | `500` | Refresh throughput budget in journal events/second |
+| `ANALYTICS_API_TOKEN` | unset | Bearer token for every analytics route; required in production |
+| `ANALYTICS_MUTATION_RATE_PER_SEC` | `5` | Per-client refresh/rebuild request budget per second |
+| `TRUST_PROXY_HOPS` | `0` | Exact trusted reverse-proxy depth for client-IP attribution; keep `0` when directly exposed |
 | `SHUTDOWN_DRAIN_MS` | `10000` | On SIGTERM/SIGINT, how long in-flight ingest and outbox dispatch may finish before the process exits (exit code `0` if drained, `1` if the window expired). Keep it below your orchestrator's kill grace period |
 | `WASM_PLUGIN_TIMEOUT_MS` | `500` | Per-invocation wall-clock budget for a WASM plugin transform, in milliseconds (max 5000). A plugin that exceeds it is killed and the subscription falls back to the raw stream |
 | `WASM_REDACTION_ENABLED` | unset (off) | Set to `1` to truncate full Stellar addresses in delivered event data to the 8-character prefix. Redaction runs after plugin transforms, never before |
@@ -102,6 +113,7 @@ The SQLite database stores:
 - **`streams` table**: Latest materialized state per stream (`stream_id`, `sender`, `recipient`, `deposit`, `withdrawn`, `status`, cancel amounts).
 - **`events` table**: Append-only log of every received event (`id`, `stream_id`, `name`, `ledger`, `ledger_closed_at`, `payload`).
 - **`indexer_state` table**: Persisted `cursor` and `lastLedger`.
+- **Outbox and analytics tables**: Durable journal sequence, per-consumer delivery intents, materialized aggregate views, stream dimensions, watermarks, and recovery counters.
 
 Repeated events are safe and idempotent: event IDs are unique, preventing double-counting across service restarts.
 
@@ -429,6 +441,46 @@ Authentication and tenant isolation are the webhook registry's: the same
 
 ---
 
+### Materialized Analytics
+
+The indexer incrementally folds its transactional outbox into per-address,
+per-asset, time-bucketed accrual, and rate-ladder views. Every view has a durable
+journal/ledger watermark; consistency lag and SLO state are exposed at
+`/metrics`. Reads can require `min_ledger` or `max_lag_events` and wait up to
+`wait_ms`, otherwise receiving `503 stale_view`. Full design and configuration:
+[docs/ANALYTICS.md](../docs/ANALYTICS.md).
+
+- `GET /api/analytics/views` — definitions, watermarks, lag, SLO and dirty state.
+- `GET /api/analytics/addresses/:address` — totals by `sender`, `recipient`, or
+  `refund` role; optional `token`.
+- `GET /api/analytics/assets` — per-token totals; optional `token`.
+- `GET /api/analytics/accrual` — event-time buckets; optional `token`, `from_ms`,
+  `to_ms`, and `limit`.
+- `GET /api/analytics/forecast` — rate-ladder projection; requires `token`,
+  accepts `at_ms` and `horizon_ms`.
+- `POST /api/analytics/refresh` — run one budgeted fold tick.
+- `POST /api/analytics/rebuild` — atomically rebuild from the surviving journal;
+  accepts an optional JSON `reason`.
+- `GET /api/analytics/refresh/stats` — store and worker counters.
+
+Responses have `{ view, data, staleness, waited_ms }`; all amounts are decimal
+strings to preserve `i128` precision. Aggregates expose neither stream ids nor
+per-stream amounts, and metric labels carry no addresses or tokens. In production,
+set `ANALYTICS_API_TOKEN` and send it as a bearer token on every analytics request;
+the token covers the whole portfolio. Refresh/rebuild mutations are rate-limited
+per client and excess requests receive `429`. Behind a reverse proxy, set
+`TRUST_PROXY_HOPS` to the exact proxy-chain depth; `0` keeps direct deployments
+from trusting forwarding headers, while an overstated depth allows spoofing.
+
+Analytics startup requires `START_LEDGER` before the contract's first event so a
+fresh database cannot silently begin at the chain tip. Upgrading an existing
+indexer database requires a fresh-database reindex because older outbox history
+lacks newly subscribed rate, ownership, and sender-transfer events. Analytics
+fails closed rather than serving incomplete history; see the
+[upgrade requirement](../docs/ANALYTICS.md#upgrade-history-requirement).
+
+---
+
 ### Event Shapes Come From the Schema Registry
 
 The names and fields this indexer decodes are not hand-maintained here: they
@@ -667,6 +719,7 @@ no webhook delivery is queued.
 - **Fail closed**: malformed or truncated payloads (`ReplayFixtureError`),
   including the #486 decoder fixtures, abort the range before it is
   checkpointed, so a partial replay never looks like a completed one.
+
 ## 8. Multi-region active-active (issue #583)
 
 `src/multiregion/` runs several fully independent regions — each polls RPC,
