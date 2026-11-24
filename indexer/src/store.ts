@@ -8,6 +8,7 @@ import { WebhookStore } from "./webhooks/store.js";
 import type { SecretCipher } from "./webhooks/secrets.js";
 import { OutboxStore, newOutboxEventFromDecoded } from "./outbox/store.js";
 import { AnomalyStore } from "./anomaly/store.js";
+import { AnalyticsStore, type AnalyticsOptions } from "./analytics/store.js";
 import { globalIndexerTracer, traceCorrelationRegistry } from "./telemetry.js";
 
 export interface IngestSummary {
@@ -28,6 +29,8 @@ export interface StreamStoreOptions {
    * `WEBHOOK_SECRET_ENCRYPTION_KEY` still opens its existing database.
    */
   webhookCipher?: SecretCipher | null;
+  /** Materialized analytics tuning; the views exist either way. */
+  analytics?: AnalyticsOptions;
 }
 
 export class StreamStore extends EventEmitter {
@@ -35,6 +38,7 @@ export class StreamStore extends EventEmitter {
   readonly webhooks: WebhookStore;
   readonly outbox: OutboxStore;
   readonly anomaly: AnomalyStore;
+  readonly analytics: AnalyticsStore;
 
   constructor(path: string, options: StreamStoreOptions = {}) {
     super();
@@ -79,6 +83,7 @@ export class StreamStore extends EventEmitter {
     this.webhooks = new WebhookStore(this.db, { cipher: options.webhookCipher ?? null });
     this.outbox = new OutboxStore(this.db);
     this.anomaly = new AnomalyStore(this.db);
+    this.analytics = new AnalyticsStore(this.db, this.outbox, options.analytics ?? {});
     this.allowNullStreamId();
   }
 

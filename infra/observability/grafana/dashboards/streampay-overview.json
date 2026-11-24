@@ -1096,6 +1096,258 @@
       "title": "Measured False-Positive Rate (24h)",
       "type": "gauge",
       "description": "The deployment-wide warning line is 30%; each tenant's own budget is usually tighter and is what GET /api/anomaly/promotion reports. Over the line means tune the rule or drop it back to shadow."
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 64 },
+      "id": 500,
+      "title": "Materialized Analytics — Freshness, Recovery & Throughput",
+      "type": "row"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 65 },
+      "id": 501,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "streampay_analytics_slo_breach",
+          "legendFormat": "{{view}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Views Outside Freshness SLO",
+      "type": "stat",
+      "description": "Must be 0 for every view. Age is measured from the watermark's chain event time; a quiet chain can age a view without adding journal lag."
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Journal events",
+            "axisPlacement": "auto",
+            "fillOpacity": 20,
+            "lineWidth": 2,
+            "showPoints": "auto"
+          },
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 65 },
+      "id": 502,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "streampay_analytics_lag_events",
+          "legendFormat": "{{view}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Consistency Lag (Unfolded Events)",
+      "type": "timeseries",
+      "description": "The journal head minus each view's durable fold position. Persistent growth means refresh capacity is below ingestion."
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Seconds",
+            "axisPlacement": "auto",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "auto"
+          },
+          "mappings": [],
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 65 },
+      "id": 503,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "streampay_analytics_staleness_seconds",
+          "legendFormat": "{{view}}",
+          "refId": "A"
+        },
+        {
+          "expr": "streampay_analytics_slo_seconds",
+          "legendFormat": "SLO",
+          "refId": "B"
+        }
+      ],
+      "title": "Watermark Event-Time Age vs SLO",
+      "type": "timeseries",
+      "description": "The SLO is a horizontal reference. If lag is zero while age grows, inspect chain event timestamps before treating it as a writer fault."
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Events/s",
+            "axisPlacement": "auto",
+            "fillOpacity": 15,
+            "lineWidth": 2,
+            "showPoints": "auto"
+          },
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 73 },
+      "id": 504,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "streampay_analytics_refresh_events_per_second",
+          "legendFormat": "Latest batch",
+          "refId": "A"
+        },
+        {
+          "expr": "streampay_analytics_budget_events_per_second",
+          "legendFormat": "Budget",
+          "refId": "B"
+        }
+      ],
+      "title": "Refresh Throughput vs Budget",
+      "type": "timeseries",
+      "description": "Latest-batch throughput is a coarse gauge; correlate it with nonzero lag and capped ticks before changing capacity."
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 73 },
+      "id": 505,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "streampay_analytics_dirty",
+          "legendFormat": "Rebuild pending",
+          "refId": "A"
+        }
+      ],
+      "title": "Reorg Invalidation / Dirty Views",
+      "type": "stat",
+      "description": "Must return to 0 after one atomic rebuild. Dirty views are not served through freshness gates."
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Reads/s or errors",
+            "axisPlacement": "auto",
+            "fillOpacity": 15,
+            "lineWidth": 2,
+            "showPoints": "auto"
+          },
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 73 },
+      "id": 506,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(streampay_analytics_read_gated_total[10m]))",
+          "legendFormat": "Gated {{result}}",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(streampay_analytics_errors_total[10m])",
+          "legendFormat": "Refresh errors",
+          "refId": "B"
+        }
+      ],
+      "title": "Gated Read Outcomes & Refresh Errors",
+      "type": "timeseries",
+      "description": "Waited-out reads are user-visible consistency failures. Errors roll back the whole refresh transaction and leave the last committed watermark intact."
     }
   ],
   "refresh": "5s",

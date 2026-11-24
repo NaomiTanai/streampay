@@ -10,6 +10,25 @@ interface: they are only ever appended to, never renumbered or reused.
 ## [Unreleased]
 
 ### Added
+- Incremental materialized analytics views with a staleness SLO (#581): the
+  indexer folds its transactional outbox into per-address, per-asset,
+  event-time accrual and rate-ladder views in bounded, crash-safe transactions.
+  Decimal `TEXT` plus `BigInt` accumulation preserves Soroban `i128` amounts;
+  shared fold logic keeps incremental refresh and atomic whole-journal rebuild
+  in parity. Every view publishes ledger/sequence watermarks, event-time
+  staleness and consistency lag, while freshness-gated reads wait or answer
+  `503 stale_view`. Reorg retractions invalidate reads until recovery, forecasts
+  integrate exact effective-time rate changes without scanning streams, and
+  metrics expose no addresses, tokens, stream identifiers or amounts.
+  Analytics-enabled startup requires `START_LEDGER` before the contract's first
+  event; existing databases without complete event history fail closed pending a
+  fresh reindex. Atomic batch creation now publishes per-stream facts, late
+  scheduled execution backfills its original window, and production API bearer
+  authentication plus trusted-proxy-aware mutation throttling are supported.
+  Includes parity, idempotency, rollback, recovery, throughput-budget,
+  privacy and HTTP tests;
+  design in [`docs/ANALYTICS.md`](docs/ANALYTICS.md), triage in RUNBOOK §10,
+  alert rules and a Grafana row.
 - Reconciler continuous state audit with verifiable divergence proofs (#586):
   the on-chain read and the indexer's own projection are merkleized with one
   canonical record encoding, so both sides publish comparable roots for the same
