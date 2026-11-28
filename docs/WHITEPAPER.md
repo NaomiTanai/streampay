@@ -400,10 +400,10 @@ It also checks that every `[Cn]` cited in the text has a row, and that every row
 | C10 |   Each occurrence shifts the window by `interval * index`   | `contracts/streaming-payments/src/schedule.rs:178` | `let shift = self.interval.saturating_mul(index as u64);` |
 | C11 |   The last shifted window end is checked to fit in u64   | `contracts/streaming-payments/src/schedule.rs:322` | `.checked_add(last_shift)` |
 | C12 |   Scheduled execution creates the stream internally (no protocol fee) and pays the keeper   | `contracts/streaming-payments/src/lib.rs:4183` | `let stream_id = Self::persist_new_stream(` |
-| C13 |   Top-up is the only post-creation writer of `deposit`   | `contracts/streaming-payments/src/lib.rs:2411` | `s.deposit = new_deposit;` |
+| C13 |   Top-up and accepted rate changes write the stored `deposit`   | `contracts/streaming-payments/src/lib.rs:2411` | `s.deposit = new_deposit;` |
 | C14 |   Top-up requires a positive amount   | `contracts/streaming-payments/src/lib.rs:2369` | `return Err(surface::reject(Branch::TopUpAmountNonPositive));` |
 | C15 |   Top-up re-validates capacity for the new deposit   | `contracts/streaming-payments/src/lib.rs:2390` | `stream::validate_capacity(new_deposit, s.duration())?;` |
-| C16 |   Migration re-stores each stream unchanged   | `contracts/streaming-payments/src/lib.rs:5311` | `stream::put_stream(&env, &s);` |
+| C16 |   Migration backfills missing oracle flags and re-stores each stream   | `contracts/streaming-payments/src/lib.rs:5311` | `stream::put_stream(&env, &s);` |
 | C17 |   The withdrawal path requires Active status   | `contracts/streaming-payments/src/lib.rs:1968` | `if s.status != StreamStatus::Active {` |
 | C18 |   A payout that makes withdrawn equal deposit marks the stream Depleted   | `contracts/streaming-payments/src/lib.rs:2042` | `s.status = StreamStatus::Depleted;` |
 | C19 |   Elapsed time is the window-clamped `now - start_time`   | `contracts/streaming-payments/src/stream.rs:1187` | `if now <= start_time {` |
